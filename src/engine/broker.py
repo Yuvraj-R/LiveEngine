@@ -16,7 +16,7 @@ class BaseBroker:
     """
     Abstract broker interface.
 
-    Later you can implement:
+    Child classes:
       - KalshiBroker (real API)
       - PaperBroker (sim / dry-run)
     """
