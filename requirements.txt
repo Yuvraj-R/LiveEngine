@@ -1,0 +1,8 @@
+# core deps
+websockets
+cryptography
+python-dotenv
+requests
+
+# optional, if you later pull NBA data in this repo
+nba_api
