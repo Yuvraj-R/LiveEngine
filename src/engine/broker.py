@@ -6,8 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Protocol, Tuple
 
-from connectors.kalshi.http_client import KalshiHTTPClient
-from strategies.strategy import TradeIntent
+from src.connectors.kalshi.http_client import KalshiHTTPClient
+from src.strategies.strategy import TradeIntent
 
 
 log = logging.getLogger(__name__)

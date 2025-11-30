@@ -4,7 +4,7 @@ import logging
 from typing import Any, AsyncIterator, Dict
 
 from .broker import Broker
-from strategies.strategy import Strategy
+from src.strategies.strategy import Strategy
 
 log = logging.getLogger(__name__)
 
