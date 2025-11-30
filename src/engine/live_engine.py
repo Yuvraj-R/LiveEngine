@@ -1,39 +1,40 @@
-# src/engine/live_engine.py
-
 from __future__ import annotations
 
-from typing import Any, AsyncIterable, Dict
+import logging
+from typing import Any, AsyncIterator, Dict
 
-from src.engine.broker import BaseBroker
-from src.strategies.strategy import Strategy
+from .broker import Broker
+from strategies.strategy import Strategy
+
+log = logging.getLogger(__name__)
 
 
-async def run_strategy_on_async_stream(
-    strategy: Strategy,
-    state_stream: AsyncIterable[Dict[str, Any]],
-    broker: BaseBroker,
-    *,
-    max_states: int | None = None,
-) -> BaseBroker:
+class LiveEngine:
     """
-    Core live loop for Phase 3:
-      - consume states from an async iterable
-      - call strategy.on_state(state, portfolio_view)
-      - hand TradeIntents to broker
+    Minimal live engine:
+      - consumes a stream of state dicts (merged game states, etc.)
+      - runs a single Strategy
+      - forwards TradeIntents to a Broker
     """
-    n = 0
 
-    async for state in state_stream:
-        portfolio_view = broker.portfolio_view()
-        intents = strategy.on_state(state, portfolio_view)
+    def __init__(self, strategy: Strategy, broker: Broker) -> None:
+        self.strategy = strategy
+        self.broker = broker
 
-        if intents:
-            broker.execute_intents(intents, state)
+    async def run(self, states: AsyncIterator[Dict[str, Any]]) -> None:
+        async for state in states:
+            try:
+                portfolio_view = self.broker.get_portfolio_view()
+                intents = self.strategy.on_state(state, portfolio_view)
+            except Exception as e:  # noqa: BLE001
+                log.exception("Strategy on_state error: %s", e)
+                continue
 
-        broker.on_state_processed(state)
+            if not intents:
+                continue
 
-        n += 1
-        if max_states is not None and n >= max_states:
-            break
-
-    return broker
+            for intent in intents:
+                try:
+                    _ = await self.broker.execute(intent, state)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("Broker execute error: %s", e)

@@ -1,202 +1,223 @@
-# src/engine/broker.py
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Protocol, Tuple
 
-from src.strategies.strategy import TradeIntent
-
-
-def _find_market_in_state(state: Dict[str, Any], market_id: str) -> Optional[Dict[str, Any]]:
-    markets = state.get("markets") or []
-    for m in markets:
-        if isinstance(m, dict) and m.get("market_id") == market_id:
-            return m
-    return None
+from connectors.kalshi.http_client import KalshiHTTPClient
+from strategies.strategy import TradeIntent
 
 
-def _pick_execution_price(m: Dict[str, Any]) -> Optional[float]:
-    """
-    Mirror your backtest execution: prefer ask, then mid (price), then bid.
-    """
-    yes_ask = m.get("yes_ask_prob")
-    mid = m.get("price")
-    yes_bid = m.get("yes_bid_prob")
-
-    for v in (yes_ask, mid, yes_bid):
-        if v is not None and v > 0.0:
-            return float(v)
-    return None
+log = logging.getLogger(__name__)
 
 
 @dataclass
-class Position:
-    market_id: str
-    avg_price: float
-    contracts: float
-    dollars_at_risk: float
+class OrderResult:
+    ok: bool
+    order_id: str | None = None
+    error: str | None = None
+    raw: Dict[str, Any] | None = None
 
 
-class BaseBroker:
-    """
-    Minimal broker interface that the live engine + strategies rely on.
-    """
+class Broker(Protocol):
+    async def execute(self, intent: TradeIntent, state: Dict[str, Any]) -> OrderResult:
+        ...
 
-    def portfolio_view(self) -> Dict[str, Any]:
-        raise NotImplementedError
-
-    def execute_intents(self, intents: List[TradeIntent], state: Dict[str, Any]) -> None:
-        raise NotImplementedError
-
-    def on_state_processed(self, state: Dict[str, Any]) -> None:
-        # Hook for logging / metrics; no-op for now.
-        return
+    def get_portfolio_view(self) -> Dict[str, Any]:
+        ...
 
 
-@dataclass
-class InMemoryBroker(BaseBroker):
-    """
-    Paper-trading broker:
-      - Tracks cash + positions in memory
-      - Applies TradeIntent(open/close) using current state prices
-      - Logs fills in self.trade_log
-    """
+# ---------------------------------------------------------------------------
+# Mock broker (used by tests / dry runs)
+# ---------------------------------------------------------------------------
 
-    cash: float = 10_000.0
-    positions: Dict[str, Position] = field(default_factory=dict)
-    trade_log: List[Dict[str, Any]] = field(default_factory=list)
-    realized_pnl: float = 0.0
+class MockBroker(Broker):
+    def __init__(self) -> None:
+        self.orders: List[Tuple[TradeIntent, Dict[str, Any]]] = []
+        self._positions: Dict[str, Dict[str, Any]] = {}
 
-    # ---------- Public API used by strategies/engine ----------
+    def get_portfolio_view(self) -> Dict[str, Any]:
+        # Very simple view: only dollars_at_risk per market
+        return {"positions": dict(self._positions)}
 
-    def portfolio_view(self) -> Dict[str, Any]:
-        """
-        Shape matches what your strategies expect:
-          {
-            "cash": float,
-            "positions": {
-              market_id: {
-                "market_id": str,
-                "avg_price": float,
-                "contracts": float,
-                "dollars_at_risk": float,
-              },
-              ...
-            }
-          }
-        """
-        return {
-            "cash": self.cash,
-            "positions": {
-                mid: {
-                    "market_id": p.market_id,
-                    "avg_price": p.avg_price,
-                    "contracts": p.contracts,
-                    "dollars_at_risk": p.dollars_at_risk,
-                }
-                for mid, p in self.positions.items()
-            },
-        }
-
-    def execute_intents(self, intents: List[TradeIntent], state: Dict[str, Any]) -> None:
-        for intent in intents:
-            self._execute_intent(intent, state)
-
-    # ---------- Internal helpers ----------
-
-    def _execute_intent(self, intent: TradeIntent, state: Dict[str, Any]) -> None:
-        if intent.action not in ("open", "close"):
-            print(f"[broker] ignoring unsupported action {intent.action!r}")
-            return
-
-        market_id = intent.market_id
-        m = _find_market_in_state(state, market_id)
-        if not m:
-            print(f"[broker] no market {market_id} in state; skipping intent")
-            return
-
-        px = _pick_execution_price(m)
-        if px is None:
-            print(f"[broker] no usable price for {market_id}; skipping intent")
-            return
-
-        ts_str = state.get("timestamp")
-        try:
-            ts = datetime.fromisoformat(ts_str) if isinstance(
-                ts_str, str) else datetime.utcnow()
-        except Exception:
-            ts = datetime.utcnow()
-
+    async def execute(self, intent: TradeIntent, state: Dict[str, Any]) -> OrderResult:
         if intent.action == "open":
-            self._open_position(market_id, px, intent.position_size, ts)
-        elif intent.action == "close":
-            self._close_position(market_id, px, ts)
-
-    def _open_position(self, market_id: str, price: float, dollars: float, ts: datetime) -> None:
-        if dollars <= 0.0:
-            return
-
-        contracts = dollars / price  # yes-shares notionally
-        pos = self.positions.get(market_id)
-
-        if pos:
-            # Simple weighted-avg price update
-            total_dollars = pos.dollars_at_risk + dollars
-            if total_dollars > 0:
-                new_avg = (pos.avg_price * pos.dollars_at_risk +
-                           price * dollars) / total_dollars
+            m_id = intent.market_id
+            pos = self._positions.get(m_id)
+            stake = float(intent.position_size)
+            if pos:
+                pos["dollars_at_risk"] += stake
             else:
-                new_avg = price
+                self._positions[m_id] = {"dollars_at_risk": stake}
 
-            pos.avg_price = new_avg
-            pos.contracts += contracts
-            pos.dollars_at_risk += dollars
+        self.orders.append((intent, state))
+        return OrderResult(ok=True, order_id=f"mock-{len(self.orders)}")
+
+
+# ---------------------------------------------------------------------------
+# Real Kalshi broker (default: DRY RUN)
+# ---------------------------------------------------------------------------
+
+class KalshiBroker(Broker):
+    """
+    Live broker that talks to Kalshi's REST API.
+
+    IMPORTANT: defaults to dry_run=True so it NEVER places real orders
+    until you explicitly opt-in.
+    """
+
+    def __init__(
+        self,
+        client: KalshiHTTPClient,
+        *,
+        dry_run: bool = True,
+        max_contracts_per_order: int = 2000,
+    ) -> None:
+        self.client = client
+        self.dry_run = dry_run
+        self.max_contracts_per_order = max_contracts_per_order
+
+        self._positions: Dict[str, Dict[str, Any]] = {}
+        self.orders_log: List[Dict[str, Any]] = []  # records for debugging
+
+    # ---------- portfolio view ----------
+
+    def get_portfolio_view(self) -> Dict[str, Any]:
+        return {"positions": dict(self._positions)}
+
+    def _update_positions_local(self, intent: TradeIntent) -> None:
+        if intent.action != "open":
+            return
+        m_id = intent.market_id
+        stake = float(intent.position_size)
+        pos = self._positions.get(m_id)
+        if pos:
+            pos["dollars_at_risk"] += stake
         else:
-            self.positions[market_id] = Position(
-                market_id=market_id,
-                avg_price=price,
-                contracts=contracts,
-                dollars_at_risk=dollars,
+            self._positions[m_id] = {"dollars_at_risk": stake}
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _effective_open_price_from_state(
+        state: Dict[str, Any],
+        market_id: str,
+    ) -> float | None:
+        markets = state.get("markets") or []
+        for m in markets:
+            if not isinstance(m, dict):
+                continue
+            if m.get("market_id") != market_id:
+                continue
+
+            yes_ask = m.get("yes_ask_prob")
+            mid = m.get("price")
+            yes_bid = m.get("yes_bid_prob")
+
+            if yes_ask is not None:
+                return float(yes_ask)
+            if mid is not None:
+                return float(mid)
+            if yes_bid is not None:
+                return float(yes_bid)
+            return None
+        return None
+
+    def _build_order_payload(
+        self,
+        intent: TradeIntent,
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Map a TradeIntent + state snapshot into an order payload
+        (without actually sending it).
+        """
+        price = self._effective_open_price_from_state(state, intent.market_id)
+        if price is None or price <= 0.0:
+            raise RuntimeError(
+                f"Cannot determine execution price for market {intent.market_id}"
             )
 
-        self.cash -= dollars  # treat as cash outlay
-        self.trade_log.append(
-            {
-                "ts": ts.isoformat(),
-                "side": "buy",
-                "market_id": market_id,
-                "price": price,
-                "contracts": contracts,
-                "dollars": dollars,
-            }
-        )
+        price_dollars = float(price)
+        price_cents = max(1, int(round(price_dollars * 100.0)))
 
-    def _close_position(self, market_id: str, price: float, ts: datetime) -> None:
-        pos = self.positions.get(market_id)
-        if not pos:
-            return
+        stake = float(intent.position_size)
+        # Rough: stake is "dollars at risk", so contracts ≈ stake / price
+        contracts = int(stake / max(price_dollars, 0.01))
+        contracts = max(1, min(contracts, self.max_contracts_per_order))
 
-        # Simple close-all
-        contracts = pos.contracts
-        dollars_in = pos.dollars_at_risk
-        dollars_out = contracts * price
-        pnl = dollars_out - dollars_in
+        client_order_id = str(uuid.uuid4())
 
-        self.cash += dollars_out
-        self.realized_pnl += pnl
-        del self.positions[market_id]
+        payload = {
+            "market_ticker": intent.market_id,
+            "side": "yes",                # late-game underdog is YES-only for now
+            "price_cents": price_cents,
+            "count": contracts,
+            "client_order_id": client_order_id,
+        }
+        return payload
 
-        self.trade_log.append(
-            {
-                "ts": ts.isoformat(),
-                "side": "sell",
-                "market_id": market_id,
-                "price": price,
-                "contracts": contracts,
-                "dollars_in": dollars_in,
-                "dollars_out": dollars_out,
-                "pnl": pnl,
-            }
-        )
+    # ---------- main entrypoint ----------
+
+    async def execute(self, intent: TradeIntent, state: Dict[str, Any]) -> OrderResult:
+        if intent.action != "open":
+            # For now we only support opening YES positions live.
+            log.info("Ignoring non-open intent for now: %r", intent)
+            return OrderResult(ok=True, order_id=None)
+
+        try:
+            payload = self._build_order_payload(intent, state)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Failed to build order payload")
+            return OrderResult(ok=False, error=str(e))
+
+        record = {
+            "intent": intent,
+            "state_ts": state.get("timestamp"),
+            "payload": payload,
+            "dry_run": self.dry_run,
+        }
+
+        # Always keep a local log (even in dry-run)
+        self.orders_log.append(record)
+
+        if self.dry_run:
+            log.info("[KalshiBroker] DRY RUN order: %s", payload)
+            self._update_positions_local(intent)
+            return OrderResult(
+                ok=True,
+                order_id=None,
+                raw={"dry_run": True, "payload": payload},
+            )
+
+        # Real order: run blocking HTTP in a thread
+        async def _submit() -> Dict[str, Any]:
+            return await asyncio.to_thread(
+                self.client.place_order,
+                market_ticker=payload["market_ticker"],
+                side=payload["side"],
+                price_cents=payload["price_cents"],
+                count=payload["count"],
+                client_order_id=payload["client_order_id"],
+            )
+
+        try:
+            resp = await _submit()
+        except Exception as e:  # noqa: BLE001
+            log.exception("Error placing Kalshi order")
+            return OrderResult(ok=False, error=str(e))
+
+        self._update_positions_local(intent)
+
+        # Try to extract an order_id if present
+        order_id = None
+        if isinstance(resp, dict):
+            order_id = (
+                resp.get("order_id")
+                or resp.get("id")
+                or (resp.get("order") or {}).get("id")
+            )
+
+        return OrderResult(ok=True, order_id=order_id, raw=resp)
