@@ -10,7 +10,7 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 nba_api==1.11.3
-numpy==2.3.5
+numpy==2.2.6
 pandas==2.3.3
 pycparser==2.23
 python-dateutil==2.9.0.post0

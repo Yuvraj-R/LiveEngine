@@ -1,5 +1,6 @@
 kalshi_private_key.pem
 src/storage/backtest_runs/*
+src/storage/kalshi/merged/states/*
 .DS_Store
 
 # Byte-compiled / optimized / DLL files
