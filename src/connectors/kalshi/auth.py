@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 # Paths / env
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../LiveEngine
+PROJECT_ROOT = Path(__file__).resolve().parents[3]  # .../LiveEngine
 load_dotenv(PROJECT_ROOT / ".env")
 
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"

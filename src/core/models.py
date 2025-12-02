@@ -1,6 +1,7 @@
+# src/core/models.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict, Literal
+from typing import Any, Dict, List, Optional, TypedDict
 
 
 # =========================
@@ -37,54 +38,12 @@ class BaseMarket(TypedDict, total=False):
 
 class BaseState(TypedDict, total=False):
     """
-    Generic snapshot of "the world" at a time for an event:
-      - a timestamp
-      - some markets
-      - optional extra context
+    Generic snapshot of 'the world' at a time for an event.
     """
     timestamp: str              # ISO8601, UTC
     event_ticker: str
-
     markets: List[BaseMarket]
-
-    # Domain-agnostic context, e.g.:
-    #   - order book depth
-    #   - election poll snapshot
-    #   - macro indicators
-    #   - etc.
     context: Dict[str, Any]
-
-
-# =========================
-# NBA-specialized children
-# =========================
-
-class NbaMoneylineMarket(BaseMarket, total=False):
-    """
-    NBA-specific extension for a moneyline-style market.
-    All fields here are OPTIONAL and only populated for NBA domains.
-    """
-    team: Optional[str]                             # "LAL", "BOS", ...
-    side: Optional[Literal["home", "away", "unknown"]]
-    line: Optional[float]                           # if we ever care (spreads, etc.)
-
-
-class NbaGameState(BaseState, total=False):
-    """
-    NBA-specific extension of BaseState with scoreboard info.
-    Again, all optional; generic strategies shouldn't rely on these.
-    """
-    game_id: str
-    home_team: str
-    away_team: str
-
-    score_home: float
-    score_away: float
-    score_diff: float          # home - away
-
-    quarter: int
-    time_remaining_minutes: float
-    time_remaining_quarter_seconds: float
 
 
 # =========================

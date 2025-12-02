@@ -1,89 +1,119 @@
 # src/core/nba_models.py
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Literal, Optional, List
 
-from src.core.models import MarketSnapshot
+from src.core.models import BaseMarket, BaseState
 
 
-@dataclass
-class NBAMoneylineMarket(MarketSnapshot):
+# =========================
+# NBA-specialized children
+# =========================
+
+class NBAMoneylineMarket(BaseMarket, total=False):
     """
-    NBA moneyline view on top of a generic MarketSnapshot.
+    NBA-specific extension for a moneyline-style market.
+    All fields here are OPTIONAL and only populated for NBA domains.
     """
-    team: Optional[str] = None           # e.g. "BOS"
-    side: str = "unknown"                # "home" | "away" | "unknown"
+    team: Optional[str]                             # "LAL", "BOS", ...
+    side: Optional[Literal["home", "away", "unknown"]]
+    # for spreads/totals later if needed
+    line: Optional[float]
 
 
-@dataclass
-class NBAScoreboardSnapshot:
+class NBAGameState(BaseState, total=False):
     """
-    Live scoreboard view for one NBA game at a point in time.
+    NBA-specific extension of BaseState with scoreboard info.
+    Strategies like LateGameUnderdog can rely on these.
     """
     game_id: str
     home_team: str
     away_team: str
 
-    score_home: int
-    score_away: int
+    score_home: float
+    score_away: float
+    score_diff: float          # home - away
 
-    quarter: int                         # 0 if pre-game
-    time_remaining_minutes: float        # approximate, whole-game minutes
+    quarter: int
+    time_remaining_minutes: float
     time_remaining_quarter_seconds: float
 
-    status: str                          # e.g. "1st Qtr", "Final"
-    timestamp: datetime
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+# =========================
+# Scoreboard snapshot used by NBA connector
+# =========================
 
+@dataclass
+class NBAScoreboardSnapshot:
+    """
+    Lightweight view of the NBA scoreboard for a single game at a point in time.
+    Used by the NBA connector + Kalshi merger, not by strategies directly.
+    """
+    game_id: str
+    home_team: str
+    away_team: str
+
+    # Current score (None if pre-game or not available)
+    score_home: Optional[float] = None
+    score_away: Optional[float] = None
+
+    # Period / quarter info
+    period: Optional[int] = None          # 1,2,3,4, OT=5, etc.
+    # raw status string, e.g. "1Q", "Halftime", "Final"
+    status: str = ""
+
+    # Raw game clock string from API, if present
+    game_clock: Optional[str] = None
+
+    # Convenience flags / derived fields
+    is_final: bool = False
+    time_remaining_minutes: Optional[float] = None
+
+
+# =========================
+# Helper to build engine-ready NBA state
+# =========================
 
 def build_nba_state_dict(
+    ts_iso: str,
+    event_ticker: str,
     scoreboard: NBAScoreboardSnapshot,
-    markets: Dict[str, NBAMoneylineMarket],
-) -> Dict[str, Any]:
+    markets: List[NBAMoneylineMarket],
+) -> NBAGameState:
     """
-    Adapt NBA scoreboard + markets into the dict-shaped state
-    expected by backtest / strategies (late_game_underdog etc.).
+    Convert a scoreboard snapshot + current markets into an NBAGameState
+    that the live engine / strategies can consume.
     """
-    score_diff = float(scoreboard.score_home - scoreboard.score_away)
+    score_home = float(
+        scoreboard.score_home) if scoreboard.score_home is not None else 0.0
+    score_away = float(
+        scoreboard.score_away) if scoreboard.score_away is not None else 0.0
+    score_diff = score_home - score_away
 
-    markets_list: list[Dict[str, Any]] = []
-    for m in markets.values():
-        markets_list.append(
-            {
-                "market_id": m.market_id,
-                "type": "moneyline",
-                "team": getattr(m, "team", None),
-                "side": getattr(m, "side", "unknown"),
-                "price": m.last_prob,
-                "yes_bid_prob": m.yes_bid_prob,
-                "yes_ask_prob": m.yes_ask_prob,
-                "volume": m.volume,
-                "open_interest": m.open_interest,
-                "status": m.status,
-            }
-        )
+    quarter = int(scoreboard.period) if scoreboard.period is not None else 0
+    trm = float(
+        scoreboard.time_remaining_minutes) if scoreboard.time_remaining_minutes is not None else 0.0
 
-    state: Dict[str, Any] = {
-        "timestamp": scoreboard.timestamp.isoformat(),
+    state: NBAGameState = {
+        "timestamp": ts_iso,
+        "event_ticker": event_ticker,
         "game_id": scoreboard.game_id,
         "home_team": scoreboard.home_team,
         "away_team": scoreboard.away_team,
-        "score_home": float(scoreboard.score_home),
-        "score_away": float(scoreboard.score_away),
+        "score_home": score_home,
+        "score_away": score_away,
         "score_diff": score_diff,
-        "quarter": int(scoreboard.quarter),
-        "time_remaining_minutes": float(scoreboard.time_remaining_minutes),
-        "time_remaining_quarter_seconds": float(
-            scoreboard.time_remaining_quarter_seconds
-        ),
-        "markets": markets_list,
+        "quarter": quarter,
+        "time_remaining_minutes": trm,
+        "time_remaining_quarter_seconds": trm * 60.0,
+        "markets": markets,
+        "context": {
+            "nba_raw": {
+                "status": scoreboard.status,
+                "game_clock": scoreboard.game_clock,
+                "is_final": scoreboard.is_final,
+            }
+        },
     }
-
-    # allow future extensions
-    state.update(scoreboard.extra or {})
-
     return state
