@@ -181,7 +181,7 @@ class NBAScoreboardClient:
         self,
         game_id: str,
         *,
-        poll_interval: float = 5.0,
+        poll_interval: float = 0.5,
         stop_on_final: bool = True,
     ) -> AsyncIterator[NBAScoreboardSnapshot]:
         """
