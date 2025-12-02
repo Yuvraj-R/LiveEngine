@@ -1,32 +1,33 @@
-from __future__ import annotations
+# src/strategies/late_game_underdog.py
 
 from typing import Any, Dict, List
-
-from src.core.models import BaseState, PortfolioView
-from .strategy import Strategy, TradeIntent
+from ..base.strategy import Strategy, TradeIntent
 
 
 class LateGameUnderdogStrategy(Strategy):
     """
-    NBA-specific strategy:
-      - Expects states that behave like NbaGameState + NbaMoneylineMarket.
-      - Generic engine only knows it's a Strategy; domain logic lives here.
+    Buy the underdog moneyline late in the game when the score is close
+    and the market is pessimistic. Let the position settle at game end.
     """
 
-    def __init__(self, params: Dict[str, Any] | None = None) -> None:
+    def __init__(self, params: Dict[str, Any] | None = None):
         super().__init__(params)
         p = self.params
 
         self.max_price: float = float(p.get("max_price", 0.15))
         self.stake: float = float(p.get("stake", 25.0))
 
-        # Tunable score + time window
+        # NEW: tunable score + time window
         self.max_score_diff: float = float(p.get("max_score_diff", 6.0))
         self.min_time_remaining: float = float(
             p.get("min_time_remaining", 0.5))
         self.max_time_remaining: float = float(
             p.get("max_time_remaining", 5.0))
         self.min_quarter: int = int(p.get("min_quarter", 4))
+
+    # -------------------------
+    # Internal helpers
+    # -------------------------
 
     def _effective_open_price(self, m: Dict[str, Any]) -> float | None:
         """
@@ -43,35 +44,33 @@ class LateGameUnderdogStrategy(Strategy):
             return mid
         return yes_bid
 
+    # -------------------------
+    # Strategy interface
+    # -------------------------
+
     def on_state(
         self,
-        state: BaseState,
-        portfolio: PortfolioView,
+        state: Dict[str, Any],
+        portfolio: Dict[str, Any],
     ) -> List[TradeIntent]:
         intents: List[TradeIntent] = []
 
-        # These fields are NBA-specific; use .get so generic markets don't explode.
-        quarter = int(state.get("quarter") or 0)
-        time_remaining = float(state.get("time_remaining_minutes") or 0.0)
-        score_diff = float(state.get("score_diff") or 999.0)
+        quarter: int = state["quarter"]
+        time_remaining: float = state["time_remaining_minutes"]
+        score_diff: float = state["score_diff"]
         markets = state.get("markets") or []
 
-        # Late-game filter
+        # Tunable late-game, close-score filter
         if not (
             quarter >= self.min_quarter
             and self.min_time_remaining < time_remaining < self.max_time_remaining
         ):
             return intents
 
-        # Filter candidate markets: generic "moneyline-like" criterion lives HERE,
-        # not in the core models.
+        # moneyline winner markets only, with usable execution price
         candidates: List[Dict[str, Any]] = []
         for m in markets:
-            if not isinstance(m, dict):
-                continue
-
-            # Domain-specific check: for NBA we expect `type == "moneyline"`.
-            if m.get("type") != "moneyline":
+            if not (isinstance(m, dict) and m.get("type") == "moneyline"):
                 continue
 
             p_eff = self._effective_open_price(m)
