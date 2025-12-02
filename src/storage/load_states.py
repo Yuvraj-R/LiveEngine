@@ -2,39 +2,93 @@
 
 from __future__ import annotations
 
-import sys
+import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
+log = logging.getLogger(__name__)
 
-# Assume LiveEngine and PredictEngine are siblings:
-#   /home/.../LiveEngine
-#   /home/.../PredictEngine
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PREDICTENGINE_ROOT = PROJECT_ROOT.parent / "PredictEngine"
+# Directory where merged game-state JSONs live:
+#   LiveEngine/src/storage/kalshi/merged/states/0022500303.json, etc.
+STATES_DIR = Path(__file__).resolve().parent / "kalshi" / "merged" / "states"
 
-# Make PredictEngine/src importable as top-level (so `data...` works)
-PE_SRC = PREDICTENGINE_ROOT / "src"
-if PE_SRC.exists():
-    sys.path.insert(0, str(PE_SRC))
 
-try:
-    # This is your existing loader in PredictEngine
-    from data.kalshi.merged.load_states import (  # type: ignore
-        load_states_for_config as _pe_load_states_for_config,
-    )
-except ImportError as e:
-    raise RuntimeError(
-        "Could not import PredictEngine's load_states_for_config. "
-        "Check that PredictEngine/src is present next to LiveEngine."
-    ) from e
+def _discover_all_game_ids() -> List[str]:
+    if not STATES_DIR.exists():
+        raise RuntimeError(
+            f"States directory not found: {STATES_DIR}. "
+            "Make sure you copied merged state files into "
+            "src/storage/kalshi/merged/states/."
+        )
+
+    game_ids: List[str] = []
+    for path in STATES_DIR.glob("*.json"):
+        game_ids.append(path.stem)
+
+    game_ids.sort()
+    return game_ids
+
+
+def _load_states_for_game(game_id: str) -> List[Dict[str, Any]]:
+    path = STATES_DIR / f"{game_id}.json"
+    if not path.exists():
+        log.warning("No states file for game_id=%s at %s", game_id, path)
+        return []
+
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Failed to parse {path}: {e}") from e
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Expected list of states in {path}, got {type(data)}")
+
+    # Assume file already sorted by timestamp; just return as-is
+    return data  # type: ignore[return-value]
 
 
 def load_states_for_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Thin bridge that delegates to PredictEngine's loader for now.
+    Load merged Kalshi+NBA states for a backtest.
 
-    Later, we can swap this out to read game states produced directly
-    by LiveEngine (e.g. data/live_states/...).
+    Supported config keys (same shape as old PredictEngine loader):
+
+      - "game_ids": List[str]  -> load exactly these game_ids, in order
+      - "game_id": str         -> shorthand for a single game
+      - otherwise              -> load *all* games found under STATES_DIR
+
+    Returns a flat list of state dicts, grouped by game:
+      [ all states for game A..., all states for game B..., ... ]
     """
-    return _pe_load_states_for_config(config)
+    # 1) Resolve which games to load
+    game_ids: List[str]
+
+    cfg_game_ids = config.get("game_ids")
+    if isinstance(cfg_game_ids, list) and cfg_game_ids:
+        game_ids = [str(g) for g in cfg_game_ids]
+    elif "game_id" in config and config["game_id"]:
+        game_ids = [str(config["game_id"])]
+    else:
+        game_ids = _discover_all_game_ids()
+
+    # Optional: respect a "max_games" limiter if present
+    max_games = config.get("max_games")
+    if isinstance(max_games, int) and max_games > 0:
+        game_ids = game_ids[:max_games]
+
+    # 2) Load states game-by-game, preserving contiguous blocks per game
+    all_states: List[Dict[str, Any]] = []
+    for gid in game_ids:
+        states = _load_states_for_game(gid)
+        if not states:
+            continue
+
+        # Sanity: ensure each state has game_id set (if missing, inject)
+        for s in states:
+            s.setdefault("game_id", gid)
+        all_states.extend(states)
+
+    return all_states
