@@ -1,5 +1,6 @@
 # src/core/models.py
 from __future__ import annotations
+from dataclasses import dataclass
 
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -64,3 +65,36 @@ class PortfolioView(TypedDict, total=False):
     cash: float
     equity: float
     positions: Dict[str, PositionView]
+
+
+# =========================
+# Backtest / trade models
+# =========================
+
+
+@dataclass
+class Position:
+    market_id: str
+    game_id: str
+    team: str
+    contracts: float
+    entry_price: float
+    open_fee: float
+
+
+@dataclass
+class Trade:
+    timestamp: str
+    market_id: str
+    action: str      # "open" | "close" | "auto_close"
+    price: float
+    contracts: float
+    pnl: float
+
+
+@dataclass
+class BacktestResult:
+    summary: Dict[str, float]
+    trades: List[Trade]
+    # [{"timestamp": ..., "equity": ...}]
+    equity_curve: List[Dict[str, float]]
