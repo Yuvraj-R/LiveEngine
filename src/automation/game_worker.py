@@ -1,5 +1,7 @@
 from __future__ import annotations
-from src.strategies.situational.deficit_recovery import DeficitRecoveryStrategy
+from src.strategies.composite import CompositeStrategy
+from src.strategies.registry import get_strategy_class
+from src.core.trade_logger import TradeLogger
 from src.storage.state_writer import PredictEngineStateWriter
 from src.engine.live_engine import LiveEngine
 from src.engine.broker import KalshiBroker
@@ -16,13 +18,13 @@ import json
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
-# Fix path to allow running as module
+# Fix path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# Strategies
+# Dynamic Strategy Loading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,30 +34,31 @@ logging.basicConfig(
 log = logging.getLogger("worker")
 
 JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs"
-PREGAME_MINUTES = 10  # Start streaming 10 mins before tip
+CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
+PREGAME_MINUTES = 10
+
+
+def _load_config():
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Config not found at {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
 
 
 def _get_tipoff_from_job(game_date: str, event_ticker: str) -> datetime | None:
-    """
-    Reads the jobs file for the given date and returns the tipoff time as a datetime object.
-    """
     jobs_path = JOBS_DIR / f"jobs_{game_date}.json"
     if not jobs_path.exists():
-        log.warning(f"Jobs file not found at {jobs_path}")
         return None
-
     try:
         with open(jobs_path, "r") as f:
             jobs = json.load(f)
-
         for job in jobs:
             if job.get("event_ticker") == event_ticker:
                 tipoff_str = job.get("tipoff_utc")
                 if tipoff_str:
                     return datetime.fromisoformat(tipoff_str)
-    except Exception as e:
-        log.error(f"Error reading job file: {e}")
-
+    except Exception:
+        pass
     return None
 
 
@@ -65,124 +68,113 @@ async def run_worker(
     home_team: str,
     away_team: str,
     market_tickers: list[str],
-    game_date: str,
-    dry_run: bool = True
+    game_date: str
 ):
-    log.info(
-        f"Initializing Worker | Game: {away_team}@{home_team} | ID: {game_id}")
+    log.info(f"Initializing Worker | {away_team}@{home_team}")
 
-    # -----------------------------------------------------------------------
-    # 0. Sleep until Pre-Game
-    # -----------------------------------------------------------------------
+    # 1. Load Configuration
+    config = _load_config()
+    trading_config = config.get("trading", {})
+
+    # Check global mode vs CLI override (CLI override usually not passed by manager anymore)
+    # We will trust the JSON config for "mode"
+    mode_str = trading_config.get("mode", "dry_run").lower()
+    is_dry_run = (mode_str != "live")
+
+    # 2. Sleep Logic
     tipoff_dt = _get_tipoff_from_job(game_date, event_ticker)
-
     if tipoff_dt:
         start_time = tipoff_dt - timedelta(minutes=PREGAME_MINUTES)
         now = datetime.now(timezone.utc)
-
-        # Ensure we are comparing offset-aware datetimes
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
 
         sleep_secs = (start_time - now).total_seconds()
-
         if sleep_secs > 0:
-            log.info(
-                f"Tipoff is {tipoff_dt}. Sleeping {sleep_secs:.0f}s until pre-game window...")
+            log.info(f"Tipoff {tipoff_dt}. Sleeping {sleep_secs:.0f}s...")
             await asyncio.sleep(sleep_secs)
-            log.info("Waking up! Starting streams.")
-        else:
-            log.info("Game is already imminent or started. Launching immediately.")
-    else:
-        log.warning("No tipoff time found in job. Launching immediately.")
+            log.info("Waking up!")
 
-    # -----------------------------------------------------------------------
-    # 1. Setup Infrastructure
-    # -----------------------------------------------------------------------
-
-    # Initialize Clients
+    # 3. Setup Clients & Broker
     nba_client = NBAScoreboardClient()
     kalshi_http = KalshiHTTPClient()
 
-    # Broker Selection
-    if dry_run:
-        log.info("Mode: DRY RUN (Real API, No Trades)")
+    if is_dry_run:
+        log.info("Mode: DRY RUN")
         broker = KalshiBroker(kalshi_http, dry_run=True)
     else:
         log.warning("Mode: LIVE REAL MONEY")
         broker = KalshiBroker(kalshi_http, dry_run=False)
 
-    # Strategy Selection
-    strategy = DeficitRecoveryStrategy({
-        "stake": 25.0,
-        "min_initial_deficit": 8.0,
-        "max_current_deficit": 4.0,
-        "max_price": 0.35,
-        "min_price": 0.02
-    })
-    log.info(f"Strategy: {strategy.__class__.__name__}")
+    trade_logger = TradeLogger(dry_run=is_dry_run)
 
-    # Engine
-    engine = LiveEngine(strategy, broker)
+    # 4. Initialize Strategies from Config
+    active_strats = []
+    strat_configs = trading_config.get("active_strategies", [])
 
-    # Storage
+    for sc in strat_configs:
+        if not sc.get("enabled", False):
+            continue
+        try:
+            s_name = sc["name"]
+            s_params = sc.get("params", {})
+            Klass = get_strategy_class(s_name)
+            instance = Klass(s_params)
+            active_strats.append(instance)
+            log.info(f"Loaded Strategy: {s_name}")
+        except Exception as e:
+            log.error(f"Failed to load strategy {sc.get('name')}: {e}")
+
+    if not active_strats:
+        log.error("No active strategies loaded! Worker will only record data.")
+        # We continue anyway to ensure data is recorded
+
+    # Wrap in Composite
+    composite_strategy = CompositeStrategy(active_strats)
+    engine = LiveEngine(composite_strategy, broker)
     state_writer = PredictEngineStateWriter(game_id)
-    log.info(f"State Writer initialized for {game_id}")
 
-    # -----------------------------------------------------------------------
-    # 2. Data Streams
-    # -----------------------------------------------------------------------
-
-    # NBA Stream (Polls every 2s)
+    # 5. Streams
     target_dt = date.fromisoformat(game_date)
     nba_stream = nba_client.poll_game(
-        game_id,
-        poll_interval=2.0,
-        stop_on_final=True,
-        target_date=target_dt
-    )
-
-    # Kalshi Stream (WebSocket)
+        game_id, poll_interval=2.0, stop_on_final=True, target_date=target_dt)
     k_stream = ticker_stream(market_tickers)
-
-    # Merger
     merged_stream = merge_nba_and_kalshi_streams(
-        event_ticker=event_ticker,
-        game_id=game_id,
-        home_team=home_team,
-        away_team=away_team,
-        tick_stream=k_stream,
-        scoreboard_stream=nba_stream,
-        initial_markets=market_tickers
+        event_ticker=event_ticker, game_id=game_id, home_team=home_team, away_team=away_team,
+        tick_stream=k_stream, scoreboard_stream=nba_stream, initial_markets=market_tickers
     )
 
-    # -----------------------------------------------------------------------
-    # 3. Main Event Loop
-    # -----------------------------------------------------------------------
+    # 6. Loop
     state_count = 0
     try:
         async for state in merged_stream:
             state_count += 1
-
-            # A. Persist State
             state_writer.append_state(state)
 
-            # B. Execute Trading Logic
             try:
                 portfolio_view = broker.get_portfolio_view()
-                intents = strategy.on_state(state, portfolio_view)
+                intents = composite_strategy.on_state(state, portfolio_view)
 
                 for intent in intents:
-                    log.info(f"TRADE INTENT: {intent}")
+                    # Execute
                     result = await broker.execute(intent, state)
+
+                    # Get strategy name we attached in CompositeStrategy
+                    strat_name = getattr(intent, 'strategy_name', 'unknown')
+
+                    # Log to CSV
+                    trade_logger.log_order_attempt(
+                        game_id, strat_name, intent, result)
+
                     if result.ok:
                         log.info(
-                            f"Order Executed: {result.order_id or 'DryRun'}")
+                            f"ORDER FILLED ({strat_name}): {intent.market_id} {intent.action}")
                     else:
-                        log.error(f"Order Failed: {result.error}")
+                        log.error(
+                            f"ORDER FAILED ({strat_name}): {result.error}")
 
             except Exception as e:
-                log.error(f"Error in strategy/broker step: {e}", exc_info=True)
+                log.error(f"Error in trading loop: {e}", exc_info=True)
 
             if state_count % 100 == 0:
                 score = f"{state.get('score_away')}-{state.get('score_home')}"
@@ -192,9 +184,7 @@ async def run_worker(
         log.error(f"Worker crashed: {e}", exc_info=True)
     finally:
         state_writer.flush()
-        log.info(
-            f"Worker finished. Total states written: {state_writer.count}")
-
+        log.info(f"Worker finished. Total states: {state_writer.count}")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -203,9 +193,8 @@ if __name__ == "__main__":
     p.add_argument("--home", required=True)
     p.add_argument("--away", required=True)
     p.add_argument("--date", required=True)
-    p.add_argument("--markets", required=True,
-                   help="Comma-separated market tickers")
-    p.add_argument("--dry-run", action="store_true", default=False)
+    p.add_argument("--markets", required=True)
+    # Note: --dry-run is removed from CLI args because we use config.json now
 
     args = p.parse_args()
     market_list = args.markets.split(",")
@@ -216,6 +205,5 @@ if __name__ == "__main__":
         home_team=args.home,
         away_team=args.away,
         market_tickers=market_list,
-        game_date=args.date,
-        dry_run=args.dry_run
+        game_date=args.date
     ))

@@ -50,9 +50,6 @@ def run_daily_cycle(target_date: date, dry_run: bool):
             "--markets", markets_str
         ]
 
-        if dry_run:
-            cmd.append("--dry-run")
-
         # Spawn independent process
         # We redirect stdout/stderr to a log file per game if desired,
         # but for now let's let them inherit to see output in systemd logs.
