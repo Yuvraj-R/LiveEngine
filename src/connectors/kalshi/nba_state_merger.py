@@ -1,12 +1,11 @@
 # src/connectors/kalshi/nba_state_merger.py
-
 from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, Optional
 
 from src.core.nba_models import (
     NBAMoneylineMarket,
@@ -19,11 +18,8 @@ from src.core.nba_models import (
 class KalshiTick:
     """
     Normalized Kalshi ticker event coming off your WS stream.
-
-    We keep it aligned with the JSONL you log in PredictEngine.
     """
     ts_iso: datetime
-    event_ticker: str
     market_ticker: str
     price_prob: Optional[float] = None
     yes_bid_prob: Optional[float] = None
@@ -43,9 +39,16 @@ class KalshiTick:
         else:
             ts = datetime.now(timezone.utc)
 
+        def _safe_float(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
         return cls(
             ts_iso=ts,
-            event_ticker=str(raw.get("event_ticker") or ""),
             market_ticker=str(raw.get("market_ticker") or ""),
             price_prob=_safe_float(raw.get("price_prob")),
             yes_bid_prob=_safe_float(raw.get("yes_bid_prob")),
@@ -56,17 +59,9 @@ class KalshiTick:
         )
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
 async def merge_nba_and_kalshi_streams(
     *,
+    event_ticker: str,
     game_id: str,
     home_team: str,
     away_team: str,
@@ -75,33 +70,30 @@ async def merge_nba_and_kalshi_streams(
     initial_markets: Optional[Iterable[str]] = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
-    Core merge pipeline (Step 3):
-
-    - Consumes raw Kalshi tick dicts (like those you write to JSONL).
-    - Consumes NBA scoreboard snapshots for the same game.
-    - Maintains latest market snapshots + latest scoreboard.
-    - Emits merged 'state' dicts compatible with your backtest engine.
-
-    This does NOT talk to WS or HTTP directly; you wire it up later by
-    passing in the appropriate async generators.
+    Merge Kalshi ticker stream + NBA scoreboard snapshots into engine-ready
+    NBA state dicts that match your backtest format.
     """
     latest_score: Optional[NBAScoreboardSnapshot] = None
-
-    # Initialize containers for market snapshots
     markets: Dict[str, NBAMoneylineMarket] = {}
 
+    # Seed with known markets if provided
     if initial_markets:
         for mt in initial_markets:
-            markets[str(mt)] = NBAMoneylineMarket(
-                market_id=str(mt),
-                last_prob=None,
+            mt_str = str(mt)
+            markets[mt_str] = NBAMoneylineMarket(
+                market_id=mt_str,
+                event_ticker=event_ticker,
+                type="moneyline",
+                price=None,
                 yes_bid_prob=None,
                 yes_ask_prob=None,
                 volume=None,
                 open_interest=None,
                 status=None,
+                meta={},
                 team=None,
                 side="unknown",
+                line=None,
             )
 
     score_done = asyncio.Event()
@@ -109,7 +101,6 @@ async def merge_nba_and_kalshi_streams(
     async def _scoreboard_worker() -> None:
         nonlocal latest_score
         async for snap in scoreboard_stream:
-            # Ensure this is the game we care about
             if snap.game_id != game_id:
                 continue
             latest_score = snap
@@ -126,58 +117,60 @@ async def merge_nba_and_kalshi_streams(
             if not mt:
                 continue
 
+            # upsert market snapshot
             m = markets.get(mt)
             if m is None:
-                # new market discovered on the fly
                 m = NBAMoneylineMarket(
                     market_id=mt,
-                    last_prob=tick.price_prob,
+                    event_ticker=event_ticker,
+                    type="moneyline",
+                    price=tick.price_prob,
                     yes_bid_prob=tick.yes_bid_prob,
                     yes_ask_prob=tick.yes_ask_prob,
                     volume=tick.volume,
                     open_interest=tick.open_interest,
                     status=tick.status,
+                    meta={},
                     team=None,
                     side="unknown",
+                    line=None,
                 )
                 markets[mt] = m
             else:
-                # update existing snapshot
                 if tick.price_prob is not None:
-                    m.last_prob = tick.price_prob
+                    m["price"] = tick.price_prob
                 if tick.yes_bid_prob is not None:
-                    m.yes_bid_prob = tick.yes_bid_prob
+                    m["yes_bid_prob"] = tick.yes_bid_prob
                 if tick.yes_ask_prob is not None:
-                    m.yes_ask_prob = tick.yes_ask_prob
+                    m["yes_ask_prob"] = tick.yes_ask_prob
                 if tick.volume is not None:
-                    m.volume = tick.volume
+                    m["volume"] = tick.volume
                 if tick.open_interest is not None:
-                    m.open_interest = tick.open_interest
+                    m["open_interest"] = tick.open_interest
                 if tick.status is not None:
-                    m.status = tick.status
+                    m["status"] = tick.status
 
             if latest_score is None:
-                # We don't have any scoreboard context yet → skip emitting.
+                # no scoreboard yet → can't build a full merged state
                 continue
 
-            # Patch team/side if we can infer from ticker suffix (e.g. ...-BOS)
-            # This is optional; if you already know mappings, you can set them
-            # before calling this function.
-            if m.team is None and "-" in mt:
+            # Infer team/side from ticker suffix (e.g. ...-BOS)
+            if m.get("team") is None and "-" in mt:
                 suffix = mt.split("-")[-1]
                 if suffix in (home_team, away_team):
-                    m.team = suffix
-                    m.side = "home" if suffix == home_team else "away"
+                    m["team"] = suffix
+                    m["side"] = "home" if suffix == home_team else "away"
 
-            # Build merged state dict in the exact format your strategy expects
-            state_dict = build_nba_state_dict(latest_score, markets)
-
-            # Overwrite timestamp with tick timestamp (more precise)
-            state_dict["timestamp"] = tick.ts_iso.isoformat()
+            state_dict = build_nba_state_dict(
+                scoreboard=latest_score,
+                markets=markets,
+                event_ticker=event_ticker,
+                ts_iso=tick.ts_iso.isoformat(),
+            )
 
             yield state_dict
 
-        # Once tick_stream ends, wait (briefly) for scoreboard to catch up
+        # once Kalshi ticker ends, wait for scoreboard to mark FINAL
         await score_done.wait()
 
     finally:

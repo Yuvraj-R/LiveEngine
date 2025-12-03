@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Protocol, Tuple
 
 from src.connectors.kalshi.http_client import KalshiHTTPClient
-from src.strategies.strategy import TradeIntent
+from src.strategies.base.strategy import TradeIntent
 
 
 log = logging.getLogger(__name__)
