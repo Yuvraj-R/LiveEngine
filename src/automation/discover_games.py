@@ -40,8 +40,46 @@ class Job:
 
 
 # ---------------------------------------------------------------------------
-# Kalshi Helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_tipoff_utc(game_date: date, status_text: str) -> Optional[str]:
+    """
+    Parse NBA status text like "7:30 pm ET" into a UTC ISO string.
+    """
+    status = status_text.strip()
+    lower = status.lower()
+
+    # We only care about scheduled times (which contain 'et' and a colon)
+    if "et" not in lower or ":" not in status:
+        return None
+
+    # Strip trailing "ET" and normalize
+    # "7:30 pm ET" -> "7:30 pm"
+    txt = status.replace("ET", "").replace("et", "").strip()
+    parts = txt.split()
+
+    # Expecting ["7:30", "PM"]
+    if len(parts) < 2:
+        return None
+
+    time_part = parts[0]
+    ampm = parts[1].upper()
+
+    try:
+        # Construct local string: "2025-12-03 7:30 PM"
+        dt_str = f"{game_date.isoformat()} {time_part} {ampm}"
+        dt_local = datetime.strptime(dt_str, "%Y-%m-%d %I:%M %p")
+
+        # Localize to Eastern Time
+        dt_et = dt_local.replace(tzinfo=ZoneInfo("America/New_York"))
+
+        # Convert to UTC
+        dt_utc = dt_et.astimezone(ZoneInfo("UTC"))
+        return dt_utc.isoformat()
+    except Exception:
+        return None
+
 
 def _fetch_kalshi_events() -> List[Dict[str, Any]]:
     """Fetch all open NBA events from Kalshi."""
@@ -69,7 +107,6 @@ def _fetch_kalshi_events() -> List[Dict[str, Any]]:
     else:
         events = []
 
-    log.info(f"Found {len(events)} Kalshi events")
     return events
 
 
@@ -103,7 +140,6 @@ def _extract_winner_markets(event: Dict[str, Any]) -> List[str]:
     markets = event.get("markets") or []
     tickers = []
     for m in markets:
-        # We only want binary winner markets (Moneyline)
         if m.get("market_type") == "binary" and "winner" in (m.get("title") or "").lower():
             if t := m.get("ticker"):
                 tickers.append(t)
@@ -118,19 +154,13 @@ def discover_jobs_for_date(target_date: date) -> List[Job]:
     log.info(f"Discovering jobs for {target_date}")
 
     # 1. Get NBA Schedule
-    # We reuse your existing NBAScoreboardClient logic indirectly or just raw call
-    # But for discovery, we need the FULL schedule, not just live updates.
-    # We will use the raw scoreboardv2 logic similar to your old script to be safe.
-
-    # Instantiate client just to get the helper logic if needed,
-    # but here we'll effectively inline the schedule fetch to keep this script standalone-ish.
     client = NBAScoreboardClient()
     nba_snapshots = client.fetch_scoreboard_for_date(target_date)
 
     # 2. Get Kalshi Events
     kalshi_events = _fetch_kalshi_events()
+    log.info(f"Found {len(kalshi_events)} Kalshi events")
 
-    # Index Kalshi events by (home, away)
     kalshi_index = {}
     for e in kalshi_events:
         et = e.get("event_ticker") or e.get("ticker")
@@ -153,26 +183,21 @@ def discover_jobs_for_date(target_date: date) -> List[Job]:
         k_event = kalshi_index.get(key)
 
         if not k_event:
-            log.warning(
-                f"No Kalshi event for NBA game {snap.away_team} @ {snap.home_team}")
             continue
 
         market_tickers = _extract_winner_markets(k_event)
         if len(market_tickers) != 2:
-            log.warning(
-                f"Skipping {key}: Found {len(market_tickers)} markets, expected 2")
             continue
 
-        # Parse tipoff from status if possible, else None (Worker will handle immediate start)
-        # NBAScoreboardSnapshot doesn't store raw tipoff time, only status text.
-        # We'll rely on the worker to sleep if the status says "7:00 PM ET".
+        # FIX: Use the _parse_tipoff_utc helper on the snapshot's status
+        tipoff_utc = _parse_tipoff_utc(target_date, snap.status)
 
         job = Job(
             game_date=target_date.isoformat(),
             game_id=gid,
             home_team=snap.home_team,
             away_team=snap.away_team,
-            tipoff_utc=None,  # Todo: Parse if strictly needed, but Worker handles "pre-game" sleep
+            tipoff_utc=tipoff_utc,
             event_ticker=k_event.get("event_ticker"),
             market_tickers=market_tickers
         )
