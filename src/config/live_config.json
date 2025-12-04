@@ -8,13 +8,11 @@
         "active_strategies": [
             {
                 "name": "deficit_recovery",
-                "enabled": false,
+                "enabled": true,
                 "params": {
-                    "stake": 25.0,
-                    "min_initial_deficit": 8.0,
-                    "max_current_deficit": 4.0,
-                    "max_price": 0.35,
-                    "min_price": 0.02
+                    "stake": 100.0,
+                    "min_initial_deficit": 10.0,
+                    "max_price": 0.20
                 }
             },
             {
