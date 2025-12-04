@@ -89,7 +89,7 @@ def build_nba_state_dict(
 
     score_home = float(scoreboard.score_home)
     score_away = float(scoreboard.score_away)
-    score_diff = score_home - score_away
+    score_diff = abs(score_home - score_away)
 
     state: NBAGameState = {
         "timestamp": ts,
