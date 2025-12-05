@@ -15,10 +15,11 @@ import asyncio
 import logging
 import sys
 import json
+import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
-# Fix path
+# Fix path to allow running as module
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -36,6 +37,9 @@ log = logging.getLogger("worker")
 JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs"
 CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
 PREGAME_MINUTES = 10
+
+# Terminal statuses that mean "Game Over, Go Home"
+TERMINAL_STATUSES = {"finalized", "settled", "closed"}
 
 
 def _load_config():
@@ -62,6 +66,24 @@ def _get_tipoff_from_job(game_date: str, event_ticker: str) -> datetime | None:
     return None
 
 
+async def _check_markets_terminal(http_client: KalshiHTTPClient, tickers: list[str]) -> bool:
+    """
+    Returns True if ALL markets are in a terminal state (finalized/settled).
+    """
+    for t in tickers:
+        try:
+            # We run this in a thread because http_client is synchronous
+            resp = await asyncio.to_thread(http_client.get_market, t)
+            m = resp.get("market") or {}
+            status = m.get("status", "").lower()
+            if status not in TERMINAL_STATUSES:
+                return False
+        except Exception as e:
+            log.warning(f"Failed to check status for {t}: {e}")
+            return False  # Assume open if check fails to be safe
+    return True
+
+
 async def run_worker(
     event_ticker: str,
     game_id: str,
@@ -75,9 +97,6 @@ async def run_worker(
     # 1. Load Configuration
     config = _load_config()
     trading_config = config.get("trading", {})
-
-    # Check global mode vs CLI override (CLI override usually not passed by manager anymore)
-    # We will trust the JSON config for "mode"
     mode_str = trading_config.get("mode", "dry_run").lower()
     is_dry_run = (mode_str != "live")
 
@@ -111,7 +130,6 @@ async def run_worker(
     # 4. Initialize Strategies from Config
     active_strats = []
     strat_configs = trading_config.get("active_strategies", [])
-
     for sc in strat_configs:
         if not sc.get("enabled", False):
             continue
@@ -136,6 +154,7 @@ async def run_worker(
 
     # 5. Streams
     target_dt = date.fromisoformat(game_date)
+    # Note: poll_game might finish if NBA says Final, but WS keeps going.
     nba_stream = nba_client.poll_game(
         game_id, poll_interval=2.0, stop_on_final=True, target_date=target_dt)
     k_stream = ticker_stream(market_tickers)
@@ -146,23 +165,31 @@ async def run_worker(
 
     # 6. Loop
     state_count = 0
+    last_rest_check = time.time()
+
     try:
         async for state in merged_stream:
             state_count += 1
             state_writer.append_state(state)
+
+            # --- EXIT CHECK ---
+            # Every 60 seconds, ask REST API if we can go home.
+            if time.time() - last_rest_check > 60:
+                is_done = await _check_markets_terminal(kalshi_http, market_tickers)
+                if is_done:
+                    log.info(
+                        "Markets confirmed CLOSED/SETTLED via REST. Exiting worker.")
+                    break
+                last_rest_check = time.time()
+            # ------------------
 
             try:
                 portfolio_view = broker.get_portfolio_view()
                 intents = composite_strategy.on_state(state, portfolio_view)
 
                 for intent in intents:
-                    # Execute
                     result = await broker.execute(intent, state)
-
-                    # Get strategy name we attached in CompositeStrategy
                     strat_name = getattr(intent, 'strategy_name', 'unknown')
-
-                    # Log to CSV
                     trade_logger.log_order_attempt(
                         game_id, strat_name, intent, result)
 
@@ -194,7 +221,6 @@ if __name__ == "__main__":
     p.add_argument("--away", required=True)
     p.add_argument("--date", required=True)
     p.add_argument("--markets", required=True)
-    # Note: --dry-run is removed from CLI args because we use config.json now
 
     args = p.parse_args()
     market_list = args.markets.split(",")
