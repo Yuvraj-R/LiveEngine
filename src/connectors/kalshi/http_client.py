@@ -10,8 +10,7 @@ from .auth import API_BASE, build_auth_headers
 class KalshiHTTPClient:
     """
     Thin, low-level REST client for Kalshi.
-
-    All methods here are synchronous; callers can wrap in asyncio.to_thread.
+    Synchronous methods; caller should wrap in asyncio.to_thread if needed.
     """
 
     def __init__(self, *, timeout: float = 10.0) -> None:
@@ -54,21 +53,27 @@ class KalshiHTTPClient:
             return {"raw": resp.text}
 
     # ------------------------------------------------------------------ #
-    # Convenience endpoints we care about first
+    # Endpoints
     # ------------------------------------------------------------------ #
 
     def get_market(self, ticker: str) -> Dict[str, Any]:
-        """
-        GET /markets/{ticker}
-        """
+        """GET /markets/{ticker}"""
         route = f"/markets/{ticker}"
         return self._request("GET", route)
 
     def get_balance(self) -> Dict[str, Any]:
         """
         GET /portfolio/balance
+        Returns dict like: {"balance": 123456} (cents)
         """
         return self._request("GET", "/portfolio/balance")
+
+    def get_portfolio_positions(self) -> Dict[str, Any]:
+        """
+        GET /portfolio/positions
+        Useful for syncing state on startup.
+        """
+        return self._request("GET", "/portfolio/positions")
 
     def place_order(
         self,
@@ -77,22 +82,31 @@ class KalshiHTTPClient:
         side: str,
         price_cents: int,
         count: int,
+        action: str = "buy",  # <--- NEW ARGUMENT
         client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         POST /portfolio/orders
 
-        side: "yes" or "no"
-        price_cents: integer [0, 100]
-        count: number of contracts
+        :param side: "yes" or "no"
+        :param action: "buy" or "sell" (Required for closing positions)
+        :param price_cents: limit price in cents (1-99)
+        :param count: number of contracts
         """
         side = side.lower()
         if side not in {"yes", "no"}:
             raise ValueError("side must be 'yes' or 'no'")
 
+        action = action.lower()
+        if action not in {"buy", "sell"}:
+            raise ValueError("action must be 'buy' or 'sell'")
+
+        # In Kalshi v2, we usually only trade 'yes' side, but buy/sell determines direction.
+        # But we pass side explicitly just in case.
+
         body: Dict[str, Any] = {
             "ticker": market_ticker,
-            "action": "buy" if side == "yes" else "sell",
+            "action": action,
             "type": "limit",
             "side": side,
             "count": int(count),
