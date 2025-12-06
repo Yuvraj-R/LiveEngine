@@ -5,7 +5,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, Optional, List
 
 from src.core.nba_models import (
     NBAMoneylineMarket,
@@ -16,9 +16,6 @@ from src.core.nba_models import (
 
 @dataclass
 class KalshiTick:
-    """
-    Normalized Kalshi ticker event coming off your WS stream.
-    """
     ts_iso: datetime
     market_ticker: str
     price_prob: Optional[float] = None
@@ -44,7 +41,7 @@ class KalshiTick:
                 return None
             try:
                 return float(v)
-            except (TypeError, ValueError):
+            except:
                 return None
 
         return cls(
@@ -70,110 +67,143 @@ async def merge_nba_and_kalshi_streams(
     initial_markets: Optional[Iterable[str]] = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
-    Merge Kalshi ticker stream + NBA scoreboard snapshots into engine-ready
-    NBA state dicts that match your backtest format.
+    Clock-Driven Merger:
+    Produces a state emission at least every 1 second, OR whenever a Kalshi tick arrives.
     """
+
+    # 1. Internal State
     latest_score: Optional[NBAScoreboardSnapshot] = None
     markets: Dict[str, NBAMoneylineMarket] = {}
 
-    # Seed with known markets if provided
+    # Seed markets
     if initial_markets:
         for mt in initial_markets:
             mt_str = str(mt)
             markets[mt_str] = NBAMoneylineMarket(
-                market_id=mt_str,
-                event_ticker=event_ticker,
-                type="moneyline",
-                price=None,
-                yes_bid_prob=None,
-                yes_ask_prob=None,
-                volume=None,
-                open_interest=None,
-                status=None,
-                meta={},
-                team=None,
-                side="unknown",
-                line=None,
+                market_id=mt_str, event_ticker=event_ticker, type="moneyline",
+                price=None, yes_bid_prob=None, yes_ask_prob=None, volume=None,
+                open_interest=None, status=None, meta={}, team=None, side="unknown", line=None
             )
 
-    score_done = asyncio.Event()
+    # 2. Queues for async decoupling
+    tick_queue = asyncio.Queue()
+    score_queue = asyncio.Queue()
 
-    async def _scoreboard_worker() -> None:
-        nonlocal latest_score
-        async for snap in scoreboard_stream:
-            if snap.game_id != game_id:
+    # 3. Background Consumers
+    async def _consume_ticks():
+        async for t in tick_stream:
+            await tick_queue.put(t)
+        await tick_queue.put(None)  # Sentinel
+
+    async def _consume_scores():
+        async for s in scoreboard_stream:
+            await score_queue.put(s)
+            if s.status.upper().startswith("FINAL"):
+                pass
+        await score_queue.put(None)
+
+    # Launch tasks
+    t_task = asyncio.create_task(_consume_ticks())
+    s_task = asyncio.create_task(_consume_scores())
+
+    # 4. Main Event Loop (Clock-Driven)
+    # We wake up every 0.1s to check queues, but we FORCE an emission if 1.0s passes
+
+    last_emit = datetime.now(timezone.utc)
+    keep_running = True
+
+    # Flags to track if streams are alive
+    ticks_alive = True
+    scores_alive = True
+
+    while keep_running:
+        # If both streams are dead, we exit
+        if not ticks_alive and not scores_alive:
+            break
+
+        did_update = False
+
+        # A. Drain Score Updates (Take latest only)
+        # We only care about the MOST RECENT score update that arrived since last loop
+        new_score = None
+        while not score_queue.empty():
+            item = score_queue.get_nowait()
+            if item is None:
+                scores_alive = False
+            else:
+                new_score = item
+
+        if new_score:
+            latest_score = new_score
+            did_update = True
+
+        # B. Process Ticks (Process ALL to catch every price change)
+        # Unlike scores, we don't skip price ticks.
+        # But to avoid stalling, we fetch a batch.
+        while not tick_queue.empty():
+            raw_tick = tick_queue.get_nowait()
+            if raw_tick is None:
+                ticks_alive = False
                 continue
-            latest_score = snap
-            if snap.status.upper().startswith("FINAL"):
-                break
-        score_done.set()
 
-    sb_task = asyncio.create_task(_scoreboard_worker())
-
-    try:
-        async for raw_tick in tick_stream:
+            # Update Market State
             tick = KalshiTick.from_raw(raw_tick)
             mt = tick.market_ticker
             if not mt:
                 continue
 
-            # upsert market snapshot
             m = markets.get(mt)
-            if m is None:
+            if not m:
+                # Should have been seeded, but create if new
                 m = NBAMoneylineMarket(
-                    market_id=mt,
-                    event_ticker=event_ticker,
-                    type="moneyline",
-                    price=tick.price_prob,
-                    yes_bid_prob=tick.yes_bid_prob,
-                    yes_ask_prob=tick.yes_ask_prob,
-                    volume=tick.volume,
-                    open_interest=tick.open_interest,
-                    status=tick.status,
-                    meta={},
-                    team=None,
-                    side="unknown",
-                    line=None,
+                    market_id=mt, event_ticker=event_ticker, type="moneyline",
+                    team=None, side="unknown"
                 )
                 markets[mt] = m
-            else:
-                if tick.price_prob is not None:
-                    m["price"] = tick.price_prob
-                if tick.yes_bid_prob is not None:
-                    m["yes_bid_prob"] = tick.yes_bid_prob
-                if tick.yes_ask_prob is not None:
-                    m["yes_ask_prob"] = tick.yes_ask_prob
-                if tick.volume is not None:
-                    m["volume"] = tick.volume
-                if tick.open_interest is not None:
-                    m["open_interest"] = tick.open_interest
-                if tick.status is not None:
-                    m["status"] = tick.status
 
-            if latest_score is None:
-                # no scoreboard yet → can't build a full merged state
-                continue
+            # Apply updates
+            if tick.price_prob is not None:
+                m["price"] = tick.price_prob
+            if tick.yes_bid_prob is not None:
+                m["yes_bid_prob"] = tick.yes_bid_prob
+            if tick.yes_ask_prob is not None:
+                m["yes_ask_prob"] = tick.yes_ask_prob
+            if tick.volume is not None:
+                m["volume"] = tick.volume
+            if tick.open_interest is not None:
+                m["open_interest"] = tick.open_interest
+            if tick.status is not None:
+                m["status"] = tick.status
 
-            # Infer team/side from ticker suffix (e.g. ...-BOS)
+            # Infer side
             if m.get("team") is None and "-" in mt:
                 suffix = mt.split("-")[-1]
                 if suffix in (home_team, away_team):
                     m["team"] = suffix
                     m["side"] = "home" if suffix == home_team else "away"
 
-            state_dict = build_nba_state_dict(
-                scoreboard=latest_score,
-                markets=markets,
-                event_ticker=event_ticker,
-                ts_iso=tick.ts_iso.isoformat(),
-            )
+            # Emit IMMEDIATELY on price change (Event-Driven aspect)
+            if latest_score:
+                yield build_nba_state_dict(latest_score, markets, event_ticker=event_ticker, ts_iso=tick.ts_iso.isoformat())
+                last_emit = datetime.now(timezone.utc)
+                did_update = True
 
-            yield state_dict
+        # C. Heartbeat Emission (Clock-Driven aspect)
+        # If no ticks happened for 1.0 second, but we have a score, emit the state.
+        # This records the passage of game time even if markets are silent.
+        now = datetime.now(timezone.utc)
+        if latest_score and (now - last_emit).total_seconds() >= 1.0:
+            yield build_nba_state_dict(latest_score, markets, event_ticker=event_ticker, ts_iso=now.isoformat())
+            last_emit = now
+            did_update = True
 
-        # once Kalshi ticker ends, wait for scoreboard to mark FINAL
-        await score_done.wait()
+        # D. Throttle
+        if not did_update:
+            await asyncio.sleep(0.1)  # Sleep brief to yield CPU
 
-    finally:
-        sb_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sb_task
+    # Cleanup
+    t_task.cancel()
+    s_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await t_task
+        await s_task
