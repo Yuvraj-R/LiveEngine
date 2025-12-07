@@ -172,6 +172,14 @@ async def run_worker(
             state_count += 1
             state_writer.append_state(state)
 
+            # Exit on NBA final
+            nba_status = state.get("context", {}).get(
+                "nba_raw", {}).get("status", "")
+            if "Final" in nba_status:
+                log.info(
+                    f"NBA Game Status is '{nba_status}'. Game over. Exiting worker.")
+                break
+
             # --- EXIT CHECK ---
             # Every 60 seconds, ask REST API if we can go home.
             if time.time() - last_rest_check > 60:
