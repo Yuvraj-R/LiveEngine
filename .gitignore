@@ -1,6 +1,7 @@
 kalshi_private_key.pem
 src/storage/backtest_runs/*
 src/storage/kalshi/merged/states/*
+src/storage/kalshi/merged/nfl_states/*
 src/storage/jobs/*
 src/storage/logs/trades/*
 src/test/data
