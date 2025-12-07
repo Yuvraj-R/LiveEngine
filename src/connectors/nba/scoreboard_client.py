@@ -1,9 +1,9 @@
 # src/connectors/nba/scoreboard_client.py
-
 from __future__ import annotations
 
 import asyncio
 import requests
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, Optional, AsyncIterator, Any
@@ -14,12 +14,9 @@ from nba_api.stats.static import teams
 
 from src.core.nba_models import NBAScoreboardSnapshot
 
-# --- MISSING CLASS RESTORED ---
-
 
 class NBAScoreboardError(RuntimeError):
     pass
-# ------------------------------
 
 
 class NBAScoreboardClient:
@@ -32,21 +29,16 @@ class NBAScoreboardClient:
             "Origin": "https://www.nba.com"
         })
 
-    # -------------------------------------------------------------------------
-    # 1. DISCOVERY (Slow, use for finding games)
-    # -------------------------------------------------------------------------
-
-    def fetch_scoreboard_for_date(
-        self,
-        target_date: date,
-    ) -> Dict[str, NBAScoreboardSnapshot]:
+    # 1. DISCOVERY
+    def fetch_scoreboard_for_date(self, target_date: date) -> Dict[str, NBAScoreboardSnapshot]:
         ds = target_date.strftime("%m/%d/%Y")
-        try:
-            sb = scoreboardv2.ScoreboardV2(
-                game_date=ds, league_id="00", day_offset=0, timeout=10)
-            data = sb.get_normalized_dict()
-        except Exception:
-            return {}
+
+        # --- REMOVED SILENT TRY/EXCEPT BLOCK ---
+        # If this fails, we WANT it to crash the log so we see why.
+        sb = scoreboardv2.ScoreboardV2(
+            game_date=ds, league_id="00", day_offset=0, timeout=10)
+        data = sb.get_normalized_dict()
+        # ---------------------------------------
 
         headers = data.get("GameHeader", []) or []
         lines = data.get("LineScore", []) or []
@@ -77,8 +69,6 @@ class NBAScoreboardClient:
                 time_remaining_minutes=0.0, time_remaining_quarter_seconds=0.0,
                 status=h.get("GAME_STATUS_TEXT", ""),
                 timestamp=now,
-
-                # Defaults for discovery
                 possession_team_id=None,
                 in_bonus_home=False, in_bonus_away=False,
                 fouls_home=0, fouls_away=0,
@@ -87,10 +77,7 @@ class NBAScoreboardClient:
             )
         return out
 
-    # -------------------------------------------------------------------------
-    # 2. LIVE POLLING (Fast, uses CDN)
-    # -------------------------------------------------------------------------
-
+    # 2. POLLING
     def _fetch_cdn_boxscore(self, game_id: str) -> Optional[NBAScoreboardSnapshot]:
         url = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
         try:
@@ -106,21 +93,17 @@ class NBAScoreboardClient:
         if not game:
             return None
 
-        # Teams
         home = game.get("homeTeam", {})
         away = game.get("awayTeam", {})
-
         home_abbr = home.get("teamTricode", "")
         away_abbr = away.get("teamTricode", "")
 
-        # Scores
         try:
             score_home = int(home.get("score", 0))
             score_away = int(away.get("score", 0))
         except:
             score_home, score_away = 0, 0
 
-        # Clock
         clock_str = game.get("gameClock", "")
         minutes = 0.0
         seconds = 0.0
@@ -132,10 +115,8 @@ class NBAScoreboardClient:
                 seconds = float(parts[1].replace("S", ""))
             except:
                 pass
-
         time_rem_sec = (minutes * 60) + seconds
 
-        # Stats
         def get_stat(team_obj, key):
             if key in team_obj:
                 return team_obj[key]
@@ -144,17 +125,13 @@ class NBAScoreboardClient:
 
         fouls_home = int(get_stat(home, "teamFouls") or 0)
         fouls_away = int(get_stat(away, "teamFouls") or 0)
-
         timeouts_home = int(home.get("timeoutsRemaining", 0))
         timeouts_away = int(away.get("timeoutsRemaining", 0))
-
         in_bonus_home = bool(home.get("inBonus", False))
         in_bonus_away = bool(away.get("inBonus", False))
 
-        # Possession
         poss_id = str(game.get("possession", ""))
         poss_abbr = None
-
         if poss_id:
             if poss_id == str(home.get("teamId")):
                 poss_abbr = home_abbr
@@ -163,39 +140,22 @@ class NBAScoreboardClient:
 
         return NBAScoreboardSnapshot(
             game_id=game_id,
-            home_team=home_abbr,
-            away_team=away_abbr,
-            score_home=score_home,
-            score_away=score_away,
+            home_team=home_abbr, away_team=away_abbr,
+            score_home=score_home, score_away=score_away,
             quarter=int(game.get("period", 0)),
             time_remaining_minutes=time_rem_sec / 60.0,
             time_remaining_quarter_seconds=time_rem_sec,
             status=game.get("gameStatusText", ""),
             timestamp=datetime.now(self.tz),
-
             possession_team_id=poss_abbr,
-            in_bonus_home=in_bonus_home,
-            in_bonus_away=in_bonus_away,
-            fouls_home=fouls_home,
-            fouls_away=fouls_away,
-            timeouts_home=timeouts_home,
-            timeouts_away=timeouts_away,
-
+            in_bonus_home=in_bonus_home, in_bonus_away=in_bonus_away,
+            fouls_home=fouls_home, fouls_away=fouls_away,
+            timeouts_home=timeouts_home, timeouts_away=timeouts_away,
             extra={}
         )
 
-    async def poll_game(
-        self,
-        game_id: str,
-        *,
-        poll_interval: float = 1.0,
-        stop_on_final: bool = True,
-        target_date: Optional[date] = None,
-    ) -> AsyncIterator[NBAScoreboardSnapshot]:
-
+    async def poll_game(self, game_id: str, *, poll_interval: float = 1.0, stop_on_final: bool = True, target_date: Optional[date] = None) -> AsyncIterator[NBAScoreboardSnapshot]:
         loop = asyncio.get_running_loop()
-        game_id = str(game_id)
-
         while True:
             snap = await loop.run_in_executor(None, self._fetch_cdn_boxscore, game_id)
             if snap:
