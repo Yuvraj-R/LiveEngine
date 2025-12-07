@@ -25,9 +25,6 @@ class NFLScoreboardClient:
         })
 
     def fetch_schedule(self, target_date: date) -> List[Dict[str, Any]]:
-        # ... (Schedule fetching logic remains identical, omitting for brevity to focus on the fix) ...
-        # [PASTE YOUR EXISTING fetch_schedule METHOD HERE IF NOT AUTOMATICALLY PRESERVED]
-        # I will include it below for completeness.
         date_str = target_date.strftime("%Y%m%d")
         url = f"{BASE_URL}/scoreboard?dates={date_str}"
         try:
@@ -59,7 +56,7 @@ class NFLScoreboardClient:
         return games_out
 
     # -------------------------------------------------------------------------
-    # 2. LIVE POLLING (Game Summary) - REWRITTEN
+    # 2. LIVE POLLING (Game Summary)
     # -------------------------------------------------------------------------
 
     def _fetch_live_summary(self, game_id: str) -> Optional[NFLScoreboardSnapshot]:
@@ -71,17 +68,22 @@ class NFLScoreboardClient:
         except Exception:
             return None
 
-        # 1. Teams & Scores
+        # 1. Access the main Competition object
         header = data.get("header", {})
-        comps = header.get("competitions", [])[0].get("competitors", [])
+        competitions = header.get("competitions", [])
+        if not competitions:
+            return None
+        # <--- CRITICAL FIX: Scope to competition
+        competition = competitions[0]
 
+        # 2. Teams & Scores
+        comps = competition.get("competitors", [])
         home_comp = next((c for c in comps if c.get("homeAway") == "home"), {})
         away_comp = next((c for c in comps if c.get("homeAway") == "away"), {})
 
         home_team = home_comp.get("team", {}).get("abbreviation", "UNK")
         away_team = away_comp.get("team", {}).get("abbreviation", "UNK")
 
-        # Helper to safely parse scores (sometimes strings)
         def parse_score(val):
             try:
                 return int(val)
@@ -91,8 +93,8 @@ class NFLScoreboardClient:
         score_home = parse_score(home_comp.get("score"))
         score_away = parse_score(away_comp.get("score"))
 
-        # 2. Clock & Status
-        status_data = header.get("status", {})
+        # 3. Clock & Status (Now pulling from competition['status'])
+        status_data = competition.get("status", {})
         status_text = status_data.get("type", {}).get("detail", "")
         quarter = status_data.get("period", 0)
         display_clock = status_data.get("displayClock", "0:00")
@@ -108,37 +110,31 @@ class NFLScoreboardClient:
 
         time_rem_sec = (minutes * 60) + seconds
 
-        # 3. Situation Extraction (The Hard Part)
-
-        # Default empty values
+        # 4. Situation Extraction
         possession_team = None
         down = 0
         distance = 0
         yardline = 0
         last_play_text = ""
 
-        # Try Root Situation first (Cleanest)
+        # Root Situation
         sit = data.get("situation", {})
 
-        # Try Current Drive if Root is missing
+        # Drive Fallback
         if not sit:
             drives = data.get("drives", {})
             current_drive = drives.get("current", {})
             if current_drive:
-                # Get the last play of the current drive
                 plays = current_drive.get("plays", [])
                 if plays:
                     last_play_obj = plays[-1]
                     last_play_text = last_play_obj.get("text", "")
-
-                    # The 'end' state of the last play is the current state of the game
                     end_state = last_play_obj.get("end", {})
 
                     down = end_state.get("down", 0)
                     distance = end_state.get("distance", 0)
                     yardline = end_state.get("yardLine", 0)
 
-                    # Possession from drive/play
                     poss_id = last_play_obj.get("start", {}).get("team", {}).get("id") or \
                         current_drive.get("team", {}).get("id")
 
@@ -147,9 +143,7 @@ class NFLScoreboardClient:
                             possession_team = home_team
                         elif str(poss_id) == str(away_comp.get("id")):
                             possession_team = away_team
-
         else:
-            # Root Situation found (Easy mode)
             down = int(sit.get("down", 0))
             distance = int(sit.get("distance", 0))
             yardline = int(sit.get("yardLine", 0))
@@ -161,9 +155,6 @@ class NFLScoreboardClient:
                     possession_team = home_team
                 elif str(poss_id) == str(away_comp.get("id")):
                     possession_team = away_team
-
-        # Timestamp
-        now = datetime.now(self.tz)
 
         return NFLScoreboardSnapshot(
             game_id=str(game_id),
@@ -179,7 +170,7 @@ class NFLScoreboardClient:
             distance=distance,
             yardline=yardline,
             status=status_text,
-            timestamp=now,
+            timestamp=datetime.now(self.tz),
             last_play=last_play_text,
             extra={}
         )
