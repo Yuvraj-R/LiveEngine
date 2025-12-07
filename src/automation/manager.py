@@ -1,11 +1,15 @@
+# src/automation/manager.py
 from __future__ import annotations
-from src.automation.discover_games import discover_jobs_for_date, _save_jobs
+from src.automation.nfl.discover_games import _save_jobs as save_nfl_jobs
+from src.automation.nfl.discover_games import discover_jobs_for_date as discover_nfl
+from src.automation.discover_games import _save_jobs as save_nba_jobs
+from src.automation.discover_games import discover_jobs_for_date as discover_nba
 
 import argparse
-import json
 import subprocess
 import sys
 import time
+import logging
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,72 +19,122 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# NBA Imports
 
-JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs"
+# NFL Imports
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s][Manager][%(message)s]",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("manager")
+
+
+def spawn_worker(sport: str, job: Any, dry_run: bool) -> subprocess.Popen:
+    """
+    Spawns a background worker process for a specific job.
+    """
+    markets_str = ",".join(job.market_tickers)
+
+    # Determine which worker script to run
+    if sport == "nba":
+        module_path = "src.automation.game_worker"
+    elif sport == "nfl":
+        module_path = "src.automation.nfl.game_worker"
+    else:
+        raise ValueError(f"Unknown sport: {sport}")
+
+    cmd = [
+        sys.executable, "-m", module_path,
+        "--event-ticker", job.event_ticker,
+        "--game-id", job.game_id,
+        "--home", job.home_team,
+        "--away", job.away_team,
+        "--date", job.game_date,
+        "--markets", markets_str
+    ]
+
+    # Note: Workers read config.json for mode, but we keep the structure clean.
+
+    # Redirect stdout/stderr to systemd journal (inherit)
+    return subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
 
 
 def run_daily_cycle(target_date: date, dry_run: bool):
-    print(f"--- [Manager] Starting cycle for {target_date} ---")
+    log.info(f"--- Starting Daily Cycle for {target_date} ---")
 
-    # 1. Discover
-    jobs = discover_jobs_for_date(target_date)
-    _save_jobs(jobs, target_date)
+    all_processes = []
 
-    if not jobs:
-        print("No jobs found. Exiting.")
+    # -----------------------------
+    # 1. NBA Cycle
+    # -----------------------------
+    try:
+        log.info("Running NBA Discovery...")
+        nba_jobs = discover_nba(target_date)
+        save_nba_jobs(nba_jobs, target_date)
+
+        if nba_jobs:
+            log.info(f"Spawning {len(nba_jobs)} NBA workers...")
+            for job in nba_jobs:
+                p = spawn_worker("nba", job, dry_run)
+                all_processes.append(("NBA", job.event_ticker, p))
+                time.sleep(0.5)  # Stagger start
+        else:
+            log.info("No NBA games found.")
+
+    except Exception as e:
+        log.error(f"NBA Cycle Failed: {e}", exc_info=True)
+
+    # -----------------------------
+    # 2. NFL Cycle
+    # -----------------------------
+    try:
+        log.info("Running NFL Discovery...")
+        nfl_jobs = discover_nfl(target_date)
+        save_nfl_jobs(nfl_jobs, target_date)
+
+        if nfl_jobs:
+            log.info(f"Spawning {len(nfl_jobs)} NFL workers...")
+            for job in nfl_jobs:
+                p = spawn_worker("nfl", job, dry_run)
+                all_processes.append(("NFL", job.event_ticker, p))
+                time.sleep(0.5)
+        else:
+            log.info("No NFL games found.")
+
+    except Exception as e:
+        log.error(f"NFL Cycle Failed: {e}", exc_info=True)
+
+    # -----------------------------
+    # 3. Monitor All
+    # -----------------------------
+    if not all_processes:
+        log.info("No workers spawned. Exiting.")
         return
 
-    # 2. Spawn Workers
-    processes = []
+    log.info(f"Monitoring {len(all_processes)} active workers...")
 
-    for job in jobs:
-        print(f"--- Spawning Worker for {job.away_team} @ {job.home_team} ---")
-
-        # Prepare arguments
-        # market_tickers is a list, join it
-        markets_str = ",".join(job.market_tickers)
-
-        cmd = [
-            sys.executable, "-m", "src.automation.game_worker",
-            "--event-ticker", job.event_ticker,
-            "--game-id", job.game_id,
-            "--home", job.home_team,
-            "--away", job.away_team,
-            "--date", job.game_date,
-            "--markets", markets_str
-        ]
-
-        # Spawn independent process
-        # We redirect stdout/stderr to a log file per game if desired,
-        # but for now let's let them inherit to see output in systemd logs.
-        p = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
-        processes.append((job.event_ticker, p))
-
-        # Stagger startups slightly
-        time.sleep(1)
-
-    print(f"--- All {len(processes)} workers spawned. Monitoring... ---")
-
-    # 3. Monitor
-    # Simple wait loop. In a more advanced version, we could restart crashed workers.
-    active = processes[:]
+    active = all_processes[:]
     while active:
         for item in active[:]:
-            ticker, p = item
+            sport, ticker, p = item
             ret = p.poll()
             if ret is not None:
-                print(f"[Manager] Worker {ticker} finished with code {ret}")
+                log.info(
+                    f"[{sport}] Worker {ticker} finished (Exit Code: {ret})")
                 active.remove(item)
         time.sleep(5)
 
-    print("--- [Manager] All workers finished. Cycle complete. ---")
+    log.info("--- All workers finished. Cycle Complete. ---")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD", default=None)
+    # We keep the --live arg for manual override/testing if needed
     parser.add_argument("--live", action="store_true",
-                        help="If set, runs REAL MONEY trades (dry_run=False)")
+                        help="Force live mode (overrides config)")
     args = parser.parse_args()
 
     if args.date:
@@ -88,13 +142,8 @@ if __name__ == "__main__":
     else:
         d = datetime.now(ZoneInfo("America/New_York")).date()
 
-    # Logic inversion: The worker script flag is --dry-run.
-    # If user passes --live here, we do NOT pass --dry-run to worker.
-    # If user does NOT pass --live, we pass --dry-run to worker.
+    # Note: The workers read 'live_config.json' directly to determine Dry/Live mode.
+    # We pass this bool just for internal logic if needed later.
     is_dry_run = not args.live
-
-    if not is_dry_run:
-        print("!!! WARNING: RUNNING IN LIVE TRADING MODE !!!")
-        time.sleep(3)
 
     run_daily_cycle(d, is_dry_run)
