@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 # --- CONFIGURATION ---
-GAME_ID = "0022500350"  # Provided ID for tonight's game
+GAME_ID = "0022500355"  # Provided ID for tonight's game
 URL = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{GAME_ID}.json"
 
 

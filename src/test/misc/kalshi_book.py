@@ -5,7 +5,7 @@ from datetime import datetime
 
 # --- CONFIGURATION ---
 # Replace this with the specific market ticker you are watching
-TICKER = "KXNBAGAME-25DEC06NOPBKN-BKN"
+TICKER = "KXNBAGAME-25DEC06LACMIN-LAC"
 
 # Public endpoint (No API Key needed for market data)
 URL = f"https://api.elections.kalshi.com/trade-api/v2/markets/{TICKER}/orderbook"
@@ -83,4 +83,4 @@ while True:
         print("Waiting for data...")
 
     # Don't spam the API too fast (Public endpoint limit)
-    time.sleep(1)
+    time.sleep(0.5)
