@@ -14,6 +14,13 @@ from nba_api.stats.static import teams
 
 from src.core.nba_models import NBAScoreboardSnapshot
 
+# --- MISSING CLASS RESTORED ---
+
+
+class NBAScoreboardError(RuntimeError):
+    pass
+# ------------------------------
+
 
 class NBAScoreboardClient:
     def __init__(self, timezone: str = "America/New_York") -> None:
@@ -28,17 +35,11 @@ class NBAScoreboardClient:
     # -------------------------------------------------------------------------
     # 1. DISCOVERY (Slow, use for finding games)
     # -------------------------------------------------------------------------
-    # ... (Discovery code remains unchanged, omitting for brevity,
-    #      BUT PLEASE KEEP THE EXISTING fetch_scoreboard_for_date METHOD HERE) ...
 
     def fetch_scoreboard_for_date(
         self,
         target_date: date,
     ) -> Dict[str, NBAScoreboardSnapshot]:
-        # [KEEP YOUR EXISTING CODE FOR THIS METHOD]
-        # Just ensure the return object includes the new fields (defaulting to 0/False)
-        # For brevity, I am pasting the relevant update to the return statement:
-
         ds = target_date.strftime("%m/%d/%Y")
         try:
             sb = scoreboardv2.ScoreboardV2(
@@ -69,7 +70,6 @@ class NBAScoreboardClient:
             h_abbr = (home_line.get("TEAM_ABBREVIATION") or "").strip().upper()
             a_abbr = (away_line.get("TEAM_ABBREVIATION") or "").strip().upper()
 
-            # Fill defaults for new fields since ScoreboardV2 doesn't have live possession
             out[gid] = NBAScoreboardSnapshot(
                 game_id=gid,
                 home_team=h_abbr, away_team=a_abbr,
@@ -88,7 +88,7 @@ class NBAScoreboardClient:
         return out
 
     # -------------------------------------------------------------------------
-    # 2. LIVE POLLING (Fast, uses CDN) - UPDATED
+    # 2. LIVE POLLING (Fast, uses CDN)
     # -------------------------------------------------------------------------
 
     def _fetch_cdn_boxscore(self, game_id: str) -> Optional[NBAScoreboardSnapshot]:
@@ -135,20 +135,10 @@ class NBAScoreboardClient:
 
         time_rem_sec = (minutes * 60) + seconds
 
-        # --- NEW ENRICHED FIELDS ---
-
-        # 1. Fouls (Usually in 'statistics' block inside team)
-        # Note: CDN structure varies. Sometimes fouls are at root of homeTeam, sometimes in stats.
-        # Let's check both or default to 0.
-        # Actually, liveData/boxscore often puts 'fouls' directly on homeTeam?
-        # No, it's usually homeTeam['statistics']['teamFouls'] if available, or just not there.
-        # Let's try simple lookups.
-
+        # Stats
         def get_stat(team_obj, key):
-            # Try root
             if key in team_obj:
                 return team_obj[key]
-            # Try statistics
             stats = team_obj.get("statistics", {})
             return stats.get(key, 0)
 
@@ -161,8 +151,7 @@ class NBAScoreboardClient:
         in_bonus_home = bool(home.get("inBonus", False))
         in_bonus_away = bool(away.get("inBonus", False))
 
-        # 2. Possession
-        # "game": { "possession": "1610612747" } -> Team ID
+        # Possession
         poss_id = str(game.get("possession", ""))
         poss_abbr = None
 
@@ -184,8 +173,7 @@ class NBAScoreboardClient:
             status=game.get("gameStatusText", ""),
             timestamp=datetime.now(self.tz),
 
-            # Enriched
-            possession_team_id=poss_abbr,  # Storing ABBREV here for ease
+            possession_team_id=poss_abbr,
             in_bonus_home=in_bonus_home,
             in_bonus_away=in_bonus_away,
             fouls_home=fouls_home,
