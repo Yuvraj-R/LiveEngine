@@ -1,4 +1,5 @@
 # src/connectors/nba/scoreboard_client.py
+
 from __future__ import annotations
 
 import asyncio
@@ -33,12 +34,10 @@ class NBAScoreboardClient:
     def fetch_scoreboard_for_date(self, target_date: date) -> Dict[str, NBAScoreboardSnapshot]:
         ds = target_date.strftime("%m/%d/%Y")
 
-        # --- REMOVED SILENT TRY/EXCEPT BLOCK ---
-        # If this fails, we WANT it to crash the log so we see why.
+        # We allow this to crash if it fails so we see it in logs
         sb = scoreboardv2.ScoreboardV2(
             game_date=ds, league_id="00", day_offset=0, timeout=10)
         data = sb.get_normalized_dict()
-        # ---------------------------------------
 
         headers = data.get("GameHeader", []) or []
         lines = data.get("LineScore", []) or []
@@ -61,6 +60,18 @@ class NBAScoreboardClient:
 
             h_abbr = (home_line.get("TEAM_ABBREVIATION") or "").strip().upper()
             a_abbr = (away_line.get("TEAM_ABBREVIATION") or "").strip().upper()
+
+            # --- FALLBACK RESTORED ---
+            if not h_abbr and home_id:
+                t_info = teams.find_team_name_by_id(home_id)
+                if t_info:
+                    h_abbr = t_info.get("abbreviation", "")
+
+            if not a_abbr and away_id:
+                t_info = teams.find_team_name_by_id(away_id)
+                if t_info:
+                    a_abbr = t_info.get("abbreviation", "")
+            # -------------------------
 
             out[gid] = NBAScoreboardSnapshot(
                 game_id=gid,
