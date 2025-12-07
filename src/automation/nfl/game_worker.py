@@ -1,6 +1,5 @@
 # src/automation/nfl/game_worker.py
 from __future__ import annotations
-from src.strategies.registry import get_strategy_class
 from src.strategies.composite import CompositeStrategy
 from src.core.trade_logger import TradeLogger
 from src.storage.state_writer import PredictEngineStateWriter
@@ -26,10 +25,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# Strategies (Can reuse generic ones or NFL specific ones later)
-# For now, we load generic strategies but they might need updating for NFL fields.
-# We will use a "NoOp" or simply run without a strategy for data collection phase.
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s][NFL-Worker][%(message)s]",
@@ -41,7 +36,7 @@ JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs" / "nfl"
 NFL_STATES_DIR = PROJECT_ROOT / "src" / \
     "storage" / "kalshi" / "merged" / "nfl_states"
 CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
-PREGAME_MINUTES = 30  # Start earlier for NFL
+PREGAME_MINUTES = 30
 
 TERMINAL_STATUSES = {"finalized", "settled", "closed"}
 
@@ -64,6 +59,9 @@ def _get_tipoff_from_job(game_date: str, event_ticker: str) -> datetime | None:
             if job.get("event_ticker") == event_ticker:
                 t = job.get("tipoff_utc")
                 if t:
+                    # FIX: Handle 'Z' suffix manually for Python < 3.11
+                    if t.endswith("Z"):
+                        t = t[:-1] + "+00:00"
                     return datetime.fromisoformat(t)
     except:
         pass
@@ -101,23 +99,23 @@ async def run_worker(
             start_time = start_time.replace(tzinfo=timezone.utc)
 
         sleep_secs = (start_time - now).total_seconds()
+
         if sleep_secs > 0:
             log.info(f"Kickoff {tipoff_dt}. Sleeping {sleep_secs:.0f}s...")
             await asyncio.sleep(sleep_secs)
             log.info("Waking up!")
+        else:
+            log.info(
+                f"Kickoff {tipoff_dt} was in the past. Starting immediately.")
+    else:
+        log.warning("No valid tipoff time found. Starting immediately.")
 
     # 2. Setup
     nfl_client = NFLScoreboardClient()
     kalshi_http = KalshiHTTPClient()
-
-    # Always Dry Run for now until strategies are ready
     broker = KalshiBroker(kalshi_http, dry_run=True)
-
-    # No strategies yet for NFL, just empty composite
     composite_strategy = CompositeStrategy([])
     engine = LiveEngine(composite_strategy, broker)
-
-    # Writer pointing to NFL directory
     state_writer = PredictEngineStateWriter(game_id, output_dir=NFL_STATES_DIR)
 
     # 3. Streams
@@ -153,14 +151,12 @@ async def run_worker(
                     break
                 last_rest_check = time.time()
 
-            # Pass through engine (No-op for now as strat list is empty)
-            # But kept structure for future
             portfolio_view = broker.get_portfolio_view()
             engine.strategy.on_state(state, portfolio_view)
 
             if state_count % 300 == 0:
-                log.info(
-                    f"Heartbeat | Ticks: {state_count} | Score: {state.get('score_away')}-{state.get('score_home')}")
+                score = f"{state.get('score_away')}-{state.get('score_home')}"
+                log.info(f"Heartbeat | Ticks: {state_count} | Score: {score}")
 
     except Exception as e:
         log.error(f"Worker crashed: {e}", exc_info=True)
