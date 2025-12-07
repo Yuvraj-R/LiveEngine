@@ -46,14 +46,10 @@ def load_and_process_json(filepath):
     df = df.sort_values(by=['market_id', 'game_timestamp'])
 
     # Calculate volume delta
-    # Grouping by market_id ensures we don't diff across different bet types
     df['volume_delta'] = df.groupby('market_id')['volume'].diff().fillna(0)
 
-    # DEBUG: Print volume stats to ensure we actually have data
-    max_vol = df['volume_delta'].max()
-    sum_vol = df['volume_delta'].sum()
-    print(
-        f"Volume Check -> Max Delta: {max_vol}, Total Volume Traded: {sum_vol}")
+    # Clip negative values just in case of data glitches, but keep linear scale
+    df['volume_delta'] = df['volume_delta'].clip(lower=0)
 
     df = df.dropna(subset=['price'])
 
@@ -61,15 +57,16 @@ def load_and_process_json(filepath):
     return df
 
 
-def plot_interactive(df, output_dir=None):
+def plot_interactive(df, output_path, volume_max):
     """
-    Generates an interactive HTML plot using Plotly.
+    Generates an interactive HTML plot using Plotly and saves to output_path.
     """
     if 'game_home_team' not in df.columns:
         print("Error: 'game_home_team' column missing.")
         return
 
     home_team_name = df['game_home_team'].iloc[0]
+    game_id = df['game_game_id'].iloc[0]
 
     # Filter for home team
     if 'side' in df.columns:
@@ -87,7 +84,7 @@ def plot_interactive(df, output_dir=None):
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,  # Decreased spacing to keep alignment tight
+        vertical_spacing=0.05,
         row_heights=[0.7, 0.3],
         specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
     )
@@ -115,15 +112,13 @@ def plot_interactive(df, output_dir=None):
     )
 
     # --- Trace 3: Volume Delta (Bottom Axis) ---
-    # FIXED: Changed from go.Bar to go.Scatter with fill='tozeroy'
-    # This creates an "Area Chart" which is visible even at high zoom levels
     fig.add_trace(
         go.Scatter(
             x=home_df['game_timestamp'],
             y=home_df['volume_delta'],
             name="Vol Change",
             mode='lines',
-            fill='tozeroy',           # Fills area under the line
+            fill='tozeroy',
             line=dict(color='gray', width=1),
             opacity=0.6
         ),
@@ -132,7 +127,7 @@ def plot_interactive(df, output_dir=None):
 
     # --- Layout & Styling ---
     fig.update_layout(
-        title=f"Interactive Market Analysis: {home_team_name}",
+        title=f"Game {game_id}: {home_team_name} (Vol Max={volume_max})",
         hovermode="x unified",
         height=800,
         xaxis_rangeslider_visible=False
@@ -143,24 +138,28 @@ def plot_interactive(df, output_dir=None):
                      0, 1], row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Score Differential",
                      row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="Volume Delta", row=2, col=1)
+
+    # FIXED: Absolute Volume Scale with User Defined Limit
+    fig.update_yaxes(title_text="Volume Delta (Qty)",
+                     range=[0, volume_max], row=2, col=1)
 
     # Save to HTML
-    if output_dir:
-        output_file = os.path.join(output_dir, 'interactive_chart.html')
-        fig.write_html(output_file)
-        print(f"Interactive chart saved to {output_file}")
-    else:
-        fig.write_html("interactive_chart.html")
-        print("Interactive chart saved to interactive_chart.html")
+    fig.write_html(output_path)
+    print(f"Interactive chart saved to {output_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze NBA Market Data")
     parser.add_argument('filename', type=str,
                         help="The JSON filename in ../data/")
+
+    # New Argument: --volume-max
+    parser.add_argument('--volume-max', type=int, default=5000,
+                        help="The Y-axis limit for the volume chart (default: 5000)")
+
     args = parser.parse_args()
 
+    # Paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, '../data')
     file_path = os.path.join(data_dir, args.filename)
@@ -168,7 +167,21 @@ def main():
     df = load_and_process_json(file_path)
 
     if df is not None and not df.empty:
-        plot_interactive(df, output_dir=script_dir)
+        # 1. Extract Game ID for filename
+        try:
+            game_id = str(df['game_game_id'].iloc[0])
+        except (KeyError, IndexError):
+            print("Warning: Could not extract game_id from data. Using 'unknown_game'.")
+            game_id = "unknown_game"
+
+        # 2. Construct Output Path
+        plots_dir = os.path.join(data_dir, 'plots', 'basic')
+        os.makedirs(plots_dir, exist_ok=True)
+
+        output_path = os.path.join(plots_dir, f"{game_id}.html")
+
+        # Pass the volume_max argument to the plotter
+        plot_interactive(df, output_path, args.volume_max)
     else:
         print("DataFrame is empty or could not be loaded.")
 
