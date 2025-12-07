@@ -39,7 +39,7 @@ CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
 PREGAME_MINUTES = 10
 
 # Terminal statuses that mean "Game Over, Go Home"
-TERMINAL_STATUSES = {"finalized", "settled", "closed"}
+TERMINAL_STATUSES = {"finalized", "settled", "closed", "final"}
 
 
 def _load_config():
