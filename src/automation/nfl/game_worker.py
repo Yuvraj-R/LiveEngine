@@ -1,0 +1,190 @@
+# src/automation/nfl/game_worker.py
+from __future__ import annotations
+from src.strategies.registry import get_strategy_class
+from src.strategies.composite import CompositeStrategy
+from src.core.trade_logger import TradeLogger
+from src.storage.state_writer import PredictEngineStateWriter
+from src.engine.live_engine import LiveEngine
+from src.engine.broker import KalshiBroker
+from src.connectors.nfl.scoreboard_client import NFLScoreboardClient
+from src.connectors.kalshi.nfl_state_merger import merge_nfl_and_kalshi_streams
+from src.connectors.kalshi.http_client import KalshiHTTPClient
+from src.connectors.kalshi.ticker_stream import ticker_stream
+
+import argparse
+import asyncio
+import logging
+import sys
+import json
+import time
+from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
+
+# Fix path
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# Strategies (Can reuse generic ones or NFL specific ones later)
+# For now, we load generic strategies but they might need updating for NFL fields.
+# We will use a "NoOp" or simply run without a strategy for data collection phase.
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s][NFL-Worker][%(message)s]",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("nfl_worker")
+
+JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs" / "nfl"
+NFL_STATES_DIR = PROJECT_ROOT / "src" / \
+    "storage" / "kalshi" / "merged" / "nfl_states"
+CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
+PREGAME_MINUTES = 30  # Start earlier for NFL
+
+TERMINAL_STATUSES = {"finalized", "settled", "closed"}
+
+
+def _load_config():
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+
+def _get_tipoff_from_job(game_date: str, event_ticker: str) -> datetime | None:
+    jobs_path = JOBS_DIR / f"jobs_{game_date}.json"
+    if not jobs_path.exists():
+        return None
+    try:
+        with open(jobs_path, "r") as f:
+            jobs = json.load(f)
+        for job in jobs:
+            if job.get("event_ticker") == event_ticker:
+                t = job.get("tipoff_utc")
+                if t:
+                    return datetime.fromisoformat(t)
+    except:
+        pass
+    return None
+
+
+async def _check_markets_terminal(http_client: KalshiHTTPClient, tickers: list[str]) -> bool:
+    for t in tickers:
+        try:
+            resp = await asyncio.to_thread(http_client.get_market, t)
+            status = (resp.get("market") or {}).get("status", "").lower()
+            if status not in TERMINAL_STATUSES:
+                return False
+        except:
+            return False
+    return True
+
+
+async def run_worker(
+    event_ticker: str,
+    game_id: str,
+    home_team: str,
+    away_team: str,
+    market_tickers: list[str],
+    game_date: str
+):
+    log.info(f"Init NFL Worker | {away_team}@{home_team} | {game_id}")
+
+    # 1. Config & Sleep
+    tipoff_dt = _get_tipoff_from_job(game_date, event_ticker)
+    if tipoff_dt:
+        start_time = tipoff_dt - timedelta(minutes=PREGAME_MINUTES)
+        now = datetime.now(timezone.utc)
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+
+        sleep_secs = (start_time - now).total_seconds()
+        if sleep_secs > 0:
+            log.info(f"Kickoff {tipoff_dt}. Sleeping {sleep_secs:.0f}s...")
+            await asyncio.sleep(sleep_secs)
+            log.info("Waking up!")
+
+    # 2. Setup
+    nfl_client = NFLScoreboardClient()
+    kalshi_http = KalshiHTTPClient()
+
+    # Always Dry Run for now until strategies are ready
+    broker = KalshiBroker(kalshi_http, dry_run=True)
+
+    # No strategies yet for NFL, just empty composite
+    composite_strategy = CompositeStrategy([])
+    engine = LiveEngine(composite_strategy, broker)
+
+    # Writer pointing to NFL directory
+    state_writer = PredictEngineStateWriter(game_id, output_dir=NFL_STATES_DIR)
+
+    # 3. Streams
+    target_dt = date.fromisoformat(game_date)
+    nfl_stream = nfl_client.poll_game(
+        game_id, poll_interval=1.0, stop_on_final=True)
+    k_stream = ticker_stream(market_tickers)
+
+    merged_stream = merge_nfl_and_kalshi_streams(
+        event_ticker=event_ticker, game_id=game_id, home_team=home_team, away_team=away_team,
+        tick_stream=k_stream, scoreboard_stream=nfl_stream, initial_markets=market_tickers
+    )
+
+    # 4. Loop
+    state_count = 0
+    last_rest_check = time.time()
+
+    try:
+        async for state in merged_stream:
+            state_count += 1
+            state_writer.append_state(state)
+
+            # Exit Logic
+            status = state.get("context", {}).get(
+                "nfl_raw", {}).get("status", "")
+            if "Final" in status:
+                log.info("NFL Game Final. Exiting.")
+                break
+
+            if time.time() - last_rest_check > 60:
+                if await _check_markets_terminal(kalshi_http, market_tickers):
+                    log.info("Markets Closed. Exiting.")
+                    break
+                last_rest_check = time.time()
+
+            # Pass through engine (No-op for now as strat list is empty)
+            # But kept structure for future
+            portfolio_view = broker.get_portfolio_view()
+            engine.strategy.on_state(state, portfolio_view)
+
+            if state_count % 300 == 0:
+                log.info(
+                    f"Heartbeat | Ticks: {state_count} | Score: {state.get('score_away')}-{state.get('score_home')}")
+
+    except Exception as e:
+        log.error(f"Worker crashed: {e}", exc_info=True)
+    finally:
+        state_writer.flush()
+        log.info(f"Done. States written: {state_writer.count}")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--event-ticker", required=True)
+    p.add_argument("--game-id", required=True)
+    p.add_argument("--home", required=True)
+    p.add_argument("--away", required=True)
+    p.add_argument("--date", required=True)
+    p.add_argument("--markets", required=True)
+
+    args = p.parse_args()
+    market_list = args.markets.split(",")
+
+    asyncio.run(run_worker(
+        event_ticker=args.event_ticker,
+        game_id=args.game_id,
+        home_team=args.home,
+        away_team=args.away,
+        market_tickers=market_list,
+        game_date=args.date
+    ))

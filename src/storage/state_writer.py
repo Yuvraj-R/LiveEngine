@@ -9,27 +9,24 @@ from typing import Any, Dict
 
 # Path definitions
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-STATES_DIR = PROJECT_ROOT / "src" / "storage" / "kalshi" / "merged" / "states"
+# Default NBA directory (Preserve behavior)
+DEFAULT_STATES_DIR = PROJECT_ROOT / "src" / \
+    "storage" / "kalshi" / "merged" / "states"
 
 
 class PredictEngineStateWriter:
     """
-    Accumulates merged NBA+Kalshi states for a single game and writes them
-    to: src/storage/kalshi/merged/states/<GAME_ID>.json
-
-    Format: A valid JSON array of state dicts, but formatted with newlines 
-    for readability:
-    [
-    {...},
-    {...}
-    ]
-
-    NOTE: Writes to disk immediately on append_state to prevent data loss.
+    Accumulates merged states for a single game and writes them to disk.
+    Append-only for safety.
     """
 
-    def __init__(self, game_id: str) -> None:
+    def __init__(self, game_id: str, output_dir: Path = None) -> None:
         self.game_id = game_id
-        self.path = STATES_DIR / f"{game_id}.json"
+
+        # Use provided dir or default to NBA
+        target_dir = output_dir if output_dir else DEFAULT_STATES_DIR
+        self.path = target_dir / f"{game_id}.json"
+
         self._count = 0
 
         # Ensure directory exists
@@ -48,51 +45,34 @@ class PredictEngineStateWriter:
         """
         Immediately writes the state to the file, maintaining a multi-line JSON array.
         """
-        # Serialize with no indent (compact object) but we will add newlines around it
         new_entry_str = json.dumps(state)
         new_entry_bytes = new_entry_str.encode("utf-8")
 
-        # Open in binary read/write mode
         with self.path.open("rb+") as f:
-            f.seek(0, 2)  # Go to end of file
+            f.seek(0, 2)  # Go to end
             file_len = f.tell()
 
-            # Logic to handle the trailing ']' or '\n]'
             if file_len <= 2:
-                # File is likely "[]". Overwrite the closing bracket.
-                # Result: [\n{...}\n]
+                # File is "[]" -> "[\n{...}\n]"
                 f.seek(-1, 2)
                 f.write(b"\n" + new_entry_bytes + b"\n]")
             else:
-                # File likely ends in "\n]".
-                # We backtrack to overwrite the "]" but keep the "\n" if we want,
-                # or strictly manage the commas.
-
-                # Scan backwards to find the last ']'
-                # Usually it's the last byte or the last non-whitespace byte.
-                # A safe bet for our format is to seek back past the \n]
-
-                # Check last 2 bytes
+                # File is "...]" -> "...,\n{...}\n]"
+                # Check for existing newline setup
                 f.seek(-2, 2)
                 tail = f.read(2)
 
                 if tail == b"\n]":
-                    # Overwrite the "\n]"
                     f.seek(-2, 2)
-                    # Add: ,\n{...}\n]
                     f.write(b",\n" + new_entry_bytes + b"\n]")
                 elif tail.endswith(b"]"):
-                    # Just ends in "]" (maybe edited manually?)
                     f.seek(-1, 2)
                     f.write(b",\n" + new_entry_bytes + b"\n]")
                 else:
-                    # Fallback: Just append (this might result in invalid json if file is corrupt)
+                    # Fallback append
                     f.write(b",\n" + new_entry_bytes + b"\n]")
 
         self._count += 1
 
     def flush(self) -> None:
-        """
-        No-op: Data is written immediately in append_state.
-        """
         pass
