@@ -1,5 +1,4 @@
 # src/storage/load_states.py
-
 from __future__ import annotations
 
 import json
@@ -7,88 +6,76 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Define Paths
+NBA_DIR = PROJECT_ROOT / "src" / "storage" / "kalshi" / "merged" / "states"
+NFL_DIR = PROJECT_ROOT / "src" / "storage" / "kalshi" / "merged" / "nfl_states"
+
 log = logging.getLogger(__name__)
-
-# Directory where merged game-state JSONs live:
-#   LiveEngine/src/storage/kalshi/merged/states/0022500303.json, etc.
-STATES_DIR = Path(__file__).resolve().parent / "kalshi" / "merged" / "states"
-
-
-def _discover_all_game_ids() -> List[str]:
-    if not STATES_DIR.exists():
-        raise RuntimeError(
-            f"States directory not found: {STATES_DIR}. "
-            "Make sure you copied merged state files into "
-            "src/storage/kalshi/merged/states/."
-        )
-
-    game_ids: List[str] = []
-    for path in STATES_DIR.glob("*.json"):
-        game_ids.append(path.stem)
-
-    game_ids.sort()
-    return game_ids
-
-
-def _load_states_for_game(game_id: str) -> List[Dict[str, Any]]:
-    path = STATES_DIR / f"{game_id}.json"
-    if not path.exists():
-        log.warning("No states file for game_id=%s at %s", game_id, path)
-        return []
-
-    with path.open("r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"Failed to parse {path}: {e}") from e
-
-    if not isinstance(data, list):
-        raise RuntimeError(
-            f"Expected list of states in {path}, got {type(data)}")
-
-    # Assume file already sorted by timestamp; just return as-is
-    return data  # type: ignore[return-value]
 
 
 def load_states_for_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Load merged Kalshi+NBA states for a backtest.
+    Load merged state files based on the config.
 
-    Supported config keys (same shape as old PredictEngine loader):
-
-      - "game_ids": List[str]  -> load exactly these game_ids, in order
-      - "game_id": str         -> shorthand for a single game
-      - otherwise              -> load *all* games found under STATES_DIR
-
-    Returns a flat list of state dicts, grouped by game:
-      [ all states for game A..., all states for game B..., ... ]
+    Args:
+        config: Dict containing:
+            - "sport" (str): "nba" or "nfl" (defaults to "nba")
+            - "game_ids" (List[str], optional): Specific games to load. 
+                                              If empty/omitted, loads ALL games in dir.
     """
-    # 1) Resolve which games to load
-    game_ids: List[str]
+    # 1. Select Directory
+    sport = config.get("sport", "nba").lower()
 
-    cfg_game_ids = config.get("game_ids")
-    if isinstance(cfg_game_ids, list) and cfg_game_ids:
-        game_ids = [str(g) for g in cfg_game_ids]
-    elif "game_id" in config and config["game_id"]:
-        game_ids = [str(config["game_id"])]
+    if sport == "nfl":
+        base_dir = NFL_DIR
     else:
-        game_ids = _discover_all_game_ids()
+        base_dir = NBA_DIR
 
-    # Optional: respect a "max_games" limiter if present
-    max_games = config.get("max_games")
-    if isinstance(max_games, int) and max_games > 0:
-        game_ids = game_ids[:max_games]
+    if not base_dir.exists():
+        log.warning(f"Data directory not found for {sport}: {base_dir}")
+        return []
 
-    # 2) Load states game-by-game, preserving contiguous blocks per game
-    all_states: List[Dict[str, Any]] = []
-    for gid in game_ids:
-        states = _load_states_for_game(gid)
-        if not states:
+    # 2. Identify Target Files
+    target_files = []
+    explicit_ids = config.get("game_ids", [])
+
+    if explicit_ids:
+        # Specific games requested
+        for gid in explicit_ids:
+            target_files.append(base_dir / f"{gid}.json")
+    else:
+        # Load ALL games in directory
+        target_files = sorted(list(base_dir.glob("*.json")))
+        log.info(
+            f"[{sport.upper()}] Auto-discovered {len(target_files)} game files.")
+
+    # 3. Read and Aggregate
+    all_states = []
+
+    for path in target_files:
+        if not path.exists():
+            log.warning(f"Skipping missing file: {path}")
             continue
 
-        # Sanity: ensure each state has game_id set (if missing, inject)
-        for s in states:
-            s.setdefault("game_id", gid)
-        all_states.extend(states)
+        try:
+            with open(path, "r") as f:
+                game_states = json.load(f)
 
+                if not game_states:
+                    continue
+
+                # Ensure states are sorted chronologically within the game file
+                game_states.sort(key=lambda x: x.get("timestamp", ""))
+                all_states.extend(game_states)
+
+        except Exception as e:
+            log.error(f"Error loading {path.name}: {e}")
+
+    # 4. Global Sort
+    # Sort all states by timestamp to ensure correct chronological playback across multiple games
+    all_states.sort(key=lambda x: x.get("timestamp", ""))
+
+    log.info(f"[{sport.upper()}] Loaded {len(all_states)} total state snapshots.")
     return all_states
