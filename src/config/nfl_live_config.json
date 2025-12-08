@@ -1,0 +1,28 @@
+{
+  "system": {
+    "sport": "nfl",
+    "max_workers": 16,
+    "log_level": "INFO"
+  },
+  "trading": {
+    "mode": "dry_run",
+    "active_strategies": [
+      {
+        "name": "price_logger", 
+        "enabled": false,
+        "params": {}
+      },
+      {
+        "name": "late_game_underdog",
+        "enabled": true,
+        "params": {
+            "stake": 100.0,
+            "max_price": 0.18,
+            "max_score_diff": 7,
+            "max_time_remaining": 5.0,
+            "min_time_remaining": 0.5
+        }
+    }
+    ]
+  }
+}

@@ -1,5 +1,6 @@
 # src/automation/nfl/game_worker.py
 from __future__ import annotations
+from src.strategies.registry import get_strategy_class
 from src.strategies.composite import CompositeStrategy
 from src.core.trade_logger import TradeLogger
 from src.storage.state_writer import PredictEngineStateWriter
@@ -35,9 +36,12 @@ log = logging.getLogger("nfl_worker")
 JOBS_DIR = PROJECT_ROOT / "src" / "storage" / "jobs" / "nfl"
 NFL_STATES_DIR = PROJECT_ROOT / "src" / \
     "storage" / "kalshi" / "merged" / "nfl_states"
-CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "live_config.json"
-PREGAME_MINUTES = 30
 
+# --- CONFIG CHANGE ---
+CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "nfl_live_config.json"
+# ---------------------
+
+PREGAME_MINUTES = 30
 TERMINAL_STATUSES = {"finalized", "settled", "closed"}
 
 
@@ -59,7 +63,6 @@ def _get_tipoff_from_job(game_date: str, event_ticker: str) -> datetime | None:
             if job.get("event_ticker") == event_ticker:
                 t = job.get("tipoff_utc")
                 if t:
-                    # FIX: Handle 'Z' suffix manually for Python < 3.11
                     if t.endswith("Z"):
                         t = t[:-1] + "+00:00"
                     return datetime.fromisoformat(t)
@@ -91,6 +94,11 @@ async def run_worker(
     log.info(f"Init NFL Worker | {away_team}@{home_team} | {game_id}")
 
     # 1. Config & Sleep
+    config = _load_config()
+    trading_config = config.get("trading", {})
+    mode_str = trading_config.get("mode", "dry_run").lower()
+    is_dry_run = (mode_str != "live")
+
     tipoff_dt = _get_tipoff_from_job(game_date, event_ticker)
     if tipoff_dt:
         start_time = tipoff_dt - timedelta(minutes=PREGAME_MINUTES)
@@ -113,12 +121,40 @@ async def run_worker(
     # 2. Setup
     nfl_client = NFLScoreboardClient()
     kalshi_http = KalshiHTTPClient()
-    broker = KalshiBroker(kalshi_http, dry_run=True)
-    composite_strategy = CompositeStrategy([])
+
+    if is_dry_run:
+        log.info("Mode: DRY RUN")
+        broker = KalshiBroker(kalshi_http, dry_run=True)
+    else:
+        log.warning("Mode: LIVE REAL MONEY")
+        broker = KalshiBroker(kalshi_http, dry_run=False)
+
+    # --- LOG SEPARATION ---
+    trade_logger = TradeLogger(sport="nfl", dry_run=is_dry_run)
+    # ----------------------
+
+    # 3. Strategies
+    active_strats = []
+    strat_configs = trading_config.get("active_strategies", [])
+    for sc in strat_configs:
+        if not sc.get("enabled", False):
+            continue
+        try:
+            s_name = sc["name"]
+            s_params = sc.get("params", {})
+            Klass = get_strategy_class(s_name)
+            instance = Klass(s_params)
+            active_strats.append(instance)
+            log.info(f"Loaded Strategy: {s_name}")
+        except Exception as e:
+            log.error(f"Failed to load strategy {sc.get('name')}: {e}")
+
+    composite_strategy = CompositeStrategy(active_strats)
     engine = LiveEngine(composite_strategy, broker)
+
     state_writer = PredictEngineStateWriter(game_id, output_dir=NFL_STATES_DIR)
 
-    # 3. Streams
+    # 4. Streams
     target_dt = date.fromisoformat(game_date)
     nfl_stream = nfl_client.poll_game(
         game_id, poll_interval=1.0, stop_on_final=True)
@@ -129,7 +165,7 @@ async def run_worker(
         tick_stream=k_stream, scoreboard_stream=nfl_stream, initial_markets=market_tickers
     )
 
-    # 4. Loop
+    # 5. Loop
     state_count = 0
     last_rest_check = time.time()
 
@@ -151,12 +187,30 @@ async def run_worker(
                     break
                 last_rest_check = time.time()
 
-            portfolio_view = broker.get_portfolio_view()
-            engine.strategy.on_state(state, portfolio_view)
+            # Trade Execution
+            try:
+                portfolio_view = broker.get_portfolio_view()
+                intents = composite_strategy.on_state(state, portfolio_view)
+
+                for intent in intents:
+                    result = await broker.execute(intent, state)
+                    strat_name = getattr(intent, 'strategy_name', 'unknown')
+                    trade_logger.log_order_attempt(
+                        game_id, strat_name, intent, result)
+
+                    if result.ok:
+                        log.info(
+                            f"ORDER FILLED ({strat_name}): {intent.market_id} {intent.action}")
+                    else:
+                        log.error(
+                            f"ORDER FAILED ({strat_name}): {result.error}")
+
+            except Exception as e:
+                log.error(f"Error in trading loop: {e}", exc_info=True)
 
             if state_count % 300 == 0:
-                score = f"{state.get('score_away')}-{state.get('score_home')}"
-                log.info(f"Heartbeat | Ticks: {state_count} | Score: {score}")
+                log.info(
+                    f"Heartbeat | Ticks: {state_count} | Score: {state.get('score_away')}-{state.get('score_home')}")
 
     except Exception as e:
         log.error(f"Worker crashed: {e}", exc_info=True)

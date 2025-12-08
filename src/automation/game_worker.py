@@ -125,7 +125,7 @@ async def run_worker(
         log.warning("Mode: LIVE REAL MONEY")
         broker = KalshiBroker(kalshi_http, dry_run=False)
 
-    trade_logger = TradeLogger(dry_run=is_dry_run)
+    trade_logger = TradeLogger(sport="nba", dry_run=is_dry_run)
 
     # 4. Initialize Strategies from Config
     active_strats = []
