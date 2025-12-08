@@ -1,3 +1,5 @@
+# src/app/backtests.py
+
 from pathlib import Path
 import datetime as dt
 import json
@@ -37,11 +39,12 @@ def _save_backtest_run(
     strategy_name: str,
     config: dict,
     result,
+    sport: str  # <--- CHANGED: Added sport arg
 ) -> str:
     """
     Persist a single backtest run under:
 
-      src/storage/backtest_runs/<strategy_name>/<run_id>/
+      src/storage/backtest_runs/<sport>/<strategy_name>/<run_id>/
 
     Files:
       - summary.json        (metrics)
@@ -50,7 +53,8 @@ def _save_backtest_run(
       - equity_curve.csv    (timestamp, equity)
     """
 
-    base_dir = Path("src/storage/backtest_runs") / strategy_name
+    # <--- CHANGED: Added sport to path
+    base_dir = Path("src/storage/backtest_runs") / sport / strategy_name
     base_dir.mkdir(parents=True, exist_ok=True)
 
     # Run ID: UTC timestamp, filesystem-safe (no colons)
@@ -138,6 +142,9 @@ def create_backtest():
     params = data.get("params", {})
     config = data.get("config", {})
 
+    # <--- CHANGED: Extract sport
+    sport = config.get("sport", "nba").lower()
+
     StrategyClass = STRATEGY_REGISTRY.get(strategy_name)
     if not StrategyClass:
         return jsonify({"error": "unknown strategy"}), 400
@@ -146,12 +153,14 @@ def create_backtest():
     result = run_backtest(strategy, config)
 
     # Persist full run to disk
-    run_id = _save_backtest_run(strategy_name, config, result)
+    # <--- CHANGED: Pass sport
+    run_id = _save_backtest_run(strategy_name, config, result, sport)
 
     # Return only light summary + metadata
     response = {
         "strategy": strategy_name,
         "run_id": run_id,
+        "sport": sport,  # <--- Added for clarity
         "summary": result.summary,
         "num_trades": len(result.trades),
     }
