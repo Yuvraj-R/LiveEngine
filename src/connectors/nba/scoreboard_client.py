@@ -128,25 +128,42 @@ class NBAScoreboardClient:
                 pass
         time_rem_sec = (minutes * 60) + seconds
 
+        # --- STATS EXTRACTION ---
         def get_stat(team_obj, key):
+            # Try statistics object first (where foulsTeam lives)
+            stats = team_obj.get("statistics", {})
+            if key in stats:
+                return stats[key]
+            # Fallback to root
             if key in team_obj:
                 return team_obj[key]
-            stats = team_obj.get("statistics", {})
-            return stats.get(key, 0)
+            return 0
 
-        fouls_home = int(get_stat(home, "teamFouls") or 0)
-        fouls_away = int(get_stat(away, "teamFouls") or 0)
+        # FIX 1: Use 'foulsTeam' based on debug output
+        fouls_home = int(get_stat(home, "foulsTeam"))
+        fouls_away = int(get_stat(away, "foulsTeam"))
+
         timeouts_home = int(home.get("timeoutsRemaining", 0))
         timeouts_away = int(away.get("timeoutsRemaining", 0))
-        in_bonus_home = bool(home.get("inBonus", False))
-        in_bonus_away = bool(away.get("inBonus", False))
 
-        poss_id = str(game.get("possession", ""))
+        # FIX 2: Handle string "0"/"1" correctly. bool("0") is True in Python.
+        def safe_bool(val):
+            try:
+                return int(val) == 1
+            except:
+                return False
+
+        in_bonus_home = safe_bool(home.get("inBonus"))
+        in_bonus_away = safe_bool(away.get("inBonus"))
+
+        # FIX 3: Possession (Likely None in this endpoint, but safe check retained)
+        poss_id = game.get("possession")  # Returns None if missing
         poss_abbr = None
         if poss_id:
-            if poss_id == str(home.get("teamId")):
+            poss_id_str = str(poss_id)
+            if poss_id_str == str(home.get("teamId")):
                 poss_abbr = home_abbr
-            elif poss_id == str(away.get("teamId")):
+            elif poss_id_str == str(away.get("teamId")):
                 poss_abbr = away_abbr
 
         return NBAScoreboardSnapshot(
