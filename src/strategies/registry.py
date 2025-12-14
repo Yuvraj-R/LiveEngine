@@ -8,6 +8,7 @@ from .mean_reversion.panic_spread_fade import PanicSpreadFadeStrategy
 from .mean_reversion.late_game_shock_fade import LateGameShockFadeStrategy
 from .momentum.price_shock_momentum import PriceShockMomentumStrategy
 from .situational.underdog_resilience import UnderdogResilienceStrategy
+from .situational.volatile_underdog_exit import VolatileUnderdogExitStrategy
 
 STRATEGY_REGISTRY = {
     "late_game_underdog": LateGameUnderdogStrategy,
@@ -20,6 +21,7 @@ STRATEGY_REGISTRY = {
     "underdog_resilience": UnderdogResilienceStrategy,
     "price_logger": PriceLoggerStrategy,
     "deficit_recovery": DeficitRecoveryStrategy,
+    "volatile_underdog_exit": VolatileUnderdogExitStrategy,
 }
 
 

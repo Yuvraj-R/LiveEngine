@@ -5,7 +5,7 @@ from datetime import datetime
 
 # --- CONFIGURATION ---
 # Replace this with the specific market ticker you are watching
-TICKER = "KXNBAGAME-25DEC06LACMIN-LAC"
+TICKER = "KXNFLGAME-25DEC08PHILAC-PHI"
 
 # Public endpoint (No API Key needed for market data)
 URL = f"https://api.elections.kalshi.com/trade-api/v2/markets/{TICKER}/orderbook"
