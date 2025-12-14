@@ -33,6 +33,7 @@ STRATEGY_REGISTRY = {
     "price_shock_momentum": PriceShockMomentumStrategy,
     "underdog_resilience": UnderdogResilienceStrategy,
     "deficit_recovery": DeficitRecoveryStrategy,
+    "volatile_underdog_exit": VolatileUnderdogExitStrategy,
 }
 
 
