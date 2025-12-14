@@ -8,7 +8,6 @@ class VolatileUnderdogExitStrategy(Strategy):
     """
     Buys the underdog late in a close game and attempts to exit 
     as soon as the position is up by a specific profit percentage (default 10%).
-    Uses Limit Orders for both entry and exit to avoid spread slippage.
     """
 
     def __init__(self, params: Dict[str, Any] | None = None):
@@ -26,21 +25,21 @@ class VolatileUnderdogExitStrategy(Strategy):
         self.min_quarter: int = int(p.get("min_quarter", 4))
 
         # Exit Parameters (Tunable)
-        self.profit_target_pct: float = float(
-            p.get("profit_target_pct", 0.10))  # 10% gain
+        self.profit_target_pct: float = float(p.get("profit_target_pct", 0.10))
 
     def _effective_open_price(self, m: Dict[str, Any]) -> float | None:
         """
-        Get the cost to buy YES. Since we use limit orders, we look at the Ask
-        to ensure we are competitive, but the execution engine will handle the limit.
+        Get the cost to buy YES.
         """
         yes_ask = m.get("yes_ask_prob")
         mid = m.get("price")
+        yes_bid = m.get("yes_bid_prob")
+
         if yes_ask is not None:
             return float(yes_ask)
         if mid is not None:
             return float(mid)
-        return None
+        return yes_bid
 
     def on_state(
         self,
@@ -51,22 +50,22 @@ class VolatileUnderdogExitStrategy(Strategy):
 
         quarter: int = state.get("quarter", 0)
         time_remaining: float = state.get("time_remaining_minutes", 0.0)
+        # Using abs() for score diff to match "closeness" regardless of who is leading
         score_diff: float = abs(
             state.get("score_home", 0) - state.get("score_away", 0))
         markets = state.get("markets") or []
         positions = portfolio.get("positions", {})
 
         # ---------------------------------------------------------
-        # 1. MONITOR EXISTING POSITIONS (The Exit Logic)
+        # 1. EXIT LOGIC: Monitor Existing Positions
         # ---------------------------------------------------------
         for mid, pos in positions.items():
-            # Find current market data for this position
             market_data = next(
                 (m for m in markets if m["market_id"] == mid), None)
             if not market_data:
                 continue
 
-            # We use the 'yes_bid_prob' to see what we can sell for right now
+            # We exit based on the BID (the price we can actually sell at)
             current_bid = market_data.get("yes_bid_prob")
             if current_bid is None:
                 continue
@@ -75,26 +74,21 @@ class VolatileUnderdogExitStrategy(Strategy):
             if entry_price == 0:
                 continue
 
-            # Calculate current profit percentage
+            # Profit Calculation
             current_gain_pct = (current_bid - entry_price) / entry_price
 
             if current_gain_pct >= self.profit_target_pct:
-                # Trigger Profit Take
                 intents.append(
                     TradeIntent(
                         market_id=mid,
                         action="close",
-                        position_size=pos["contracts"] *
-                        current_bid,  # Close full position
-                        price=current_bid  # Limit order at the current bid
+                        position_size=pos["contracts"] * current_bid
                     )
                 )
 
         # ---------------------------------------------------------
-        # 2. EVALUATE NEW ENTRIES (The Entry Logic)
+        # 2. ENTRY LOGIC: Evaluate New Underdogs
         # ---------------------------------------------------------
-        # Only look for new entries if we aren't already in an exit-monitoring loop
-        # and the time/score windows match.
         in_window = (
             quarter >= self.min_quarter
             and self.min_time_remaining < time_remaining < self.max_time_remaining
@@ -109,18 +103,18 @@ class VolatileUnderdogExitStrategy(Strategy):
                 continue
 
             p_eff = self._effective_open_price(m)
+            # Standard underdog price filter
             if p_eff is None or not (0.01 < p_eff <= self.max_price):
                 continue
 
-            # Risk Check: Don't double dip
+            # Only open if we don't already have this market
             market_id = m["market_id"]
             if market_id not in positions:
                 intents.append(
                     TradeIntent(
                         market_id=market_id,
                         action="open",
-                        position_size=self.stake,
-                        price=p_eff  # Limit order at the calculated effective price
+                        position_size=self.stake
                     )
                 )
 
