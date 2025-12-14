@@ -18,6 +18,7 @@ from src.strategies import (
     PriceShockMomentumStrategy,
     UnderdogResilienceStrategy,
     DeficitRecoveryStrategy,
+    VolatileUnderdogExitStrategy,
 )
 
 bp = Blueprint("backtests", __name__)

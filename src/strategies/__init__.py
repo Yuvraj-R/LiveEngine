@@ -1,6 +1,7 @@
 from .situational.underdog_resilience import UnderdogResilienceStrategy
 from .situational.tight_game_coinflip import TightGameCoinflipStrategy
 from .situational.late_game_underdog import LateGameUnderdogStrategy
+from .situational.volatile_underdog_exit import VolatileUnderdogExitStrategy
 from .momentum.price_shock_momentum import PriceShockMomentumStrategy
 from .momentum.micro_momentum_follow import MicroMomentumFollowStrategy
 from .mean_reversion.panic_spread_fade import PanicSpreadFadeStrategy
