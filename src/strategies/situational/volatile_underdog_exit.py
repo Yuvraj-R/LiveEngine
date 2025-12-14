@@ -7,7 +7,8 @@ from ..base.strategy import Strategy, TradeIntent
 class VolatileUnderdogExitStrategy(Strategy):
     """
     Buys the underdog late in a close game and attempts to exit 
-    as soon as the position is up by a specific profit percentage (default 10%).
+    as soon as the price (implied probability) increases by an absolute 
+    amount (e.g., 0.15 -> 0.25).
     """
 
     def __init__(self, params: Dict[str, Any] | None = None):
@@ -24,13 +25,11 @@ class VolatileUnderdogExitStrategy(Strategy):
             p.get("max_time_remaining", 5.0))
         self.min_quarter: int = int(p.get("min_quarter", 4))
 
-        # Exit Parameters (Tunable)
-        self.profit_target_pct: float = float(p.get("profit_target_pct", 0.10))
+        # Exit Parameters: Absolute Probability Gain
+        # Default 0.10 means: If bought at 0.15, exit at 0.25
+        self.target_gain_abs: float = float(p.get("target_gain_abs", 0.10))
 
     def _effective_open_price(self, m: Dict[str, Any]) -> float | None:
-        """
-        Get the cost to buy YES.
-        """
         yes_ask = m.get("yes_ask_prob")
         mid = m.get("price")
         yes_bid = m.get("yes_bid_prob")
@@ -50,14 +49,13 @@ class VolatileUnderdogExitStrategy(Strategy):
 
         quarter: int = state.get("quarter", 0)
         time_remaining: float = state.get("time_remaining_minutes", 0.0)
-        # Using abs() for score diff to match "closeness" regardless of who is leading
         score_diff: float = abs(
             state.get("score_home", 0) - state.get("score_away", 0))
         markets = state.get("markets") or []
         positions = portfolio.get("positions", {})
 
         # ---------------------------------------------------------
-        # 1. EXIT LOGIC: Monitor Existing Positions
+        # 1. EXIT LOGIC: Check for the 10-point spike
         # ---------------------------------------------------------
         for mid, pos in positions.items():
             market_data = next(
@@ -65,7 +63,6 @@ class VolatileUnderdogExitStrategy(Strategy):
             if not market_data:
                 continue
 
-            # We exit based on the BID (the price we can actually sell at)
             current_bid = market_data.get("yes_bid_prob")
             if current_bid is None:
                 continue
@@ -74,10 +71,11 @@ class VolatileUnderdogExitStrategy(Strategy):
             if entry_price == 0:
                 continue
 
-            # Profit Calculation
-            current_gain_pct = (current_bid - entry_price) / entry_price
+            # NEW: Absolute difference calculation
+            # Example: 0.25 (current bid) - 0.15 (entry) = 0.10
+            actual_gain_abs = current_bid - entry_price
 
-            if current_gain_pct >= self.profit_target_pct:
+            if actual_gain_abs >= self.target_gain_abs:
                 intents.append(
                     TradeIntent(
                         market_id=mid,
@@ -87,7 +85,7 @@ class VolatileUnderdogExitStrategy(Strategy):
                 )
 
         # ---------------------------------------------------------
-        # 2. ENTRY LOGIC: Evaluate New Underdogs
+        # 2. ENTRY LOGIC
         # ---------------------------------------------------------
         in_window = (
             quarter >= self.min_quarter
@@ -103,11 +101,9 @@ class VolatileUnderdogExitStrategy(Strategy):
                 continue
 
             p_eff = self._effective_open_price(m)
-            # Standard underdog price filter
             if p_eff is None or not (0.01 < p_eff <= self.max_price):
                 continue
 
-            # Only open if we don't already have this market
             market_id = m["market_id"]
             if market_id not in positions:
                 intents.append(
